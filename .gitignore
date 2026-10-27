@@ -1,0 +1,20 @@
+# SwiftPM
+.build/
+.swiftpm/
+*.xcodeproj
+
+# Build output
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+
+# Temporary
+*.tmp
