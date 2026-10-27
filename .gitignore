@@ -1,10 +1,22 @@
-# SwiftPM
+# SwiftPM (legacy macOS version)
 .build/
 .swiftpm/
 *.xcodeproj
 
-# Build output
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+package-lock.json
+
+# Build output (legacy)
 build/
+build-tauri/
+
+# Tauri generated icons duplicates
+src-tauri/icons/FileLocker.iconset/
 
 # macOS
 .DS_Store

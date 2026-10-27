@@ -1,0 +1,14 @@
+{
+  "name": "filelocker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "本地文件保险箱 - 跨平台",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  }
+}

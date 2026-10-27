@@ -1,0 +1,1522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>文件保险箱</title>
+<style>
+  :root {
+    --primary: #007AFF;
+    --primary-hover: #0066DD;
+    --danger: #FF3B30;
+    --bg: #FFFFFF;
+    --bg-secondary: #F5F5F7;
+    --border: #D1D1D6;
+    --border-light: #E5E5EA;
+    --text: #1D1D1F;
+    --text-secondary: #86868B;
+    --hover: #F2F2F7;
+    --selected: #E3F0FF;
+    --radius: 8px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --primary: #0A84FF;
+      --primary-hover: #409CFF;
+      --danger: #FF453A;
+      --bg: #1C1C1E;
+      --bg-secondary: #2C2C2E;
+      --border: #38383A;
+      --border-light: #2C2C2E;
+      --text: #F5F5F7;
+      --text-secondary: #98989D;
+      --hover: #2C2C2E;
+      --selected: #0A3A6B;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #app { height: 100vh; display: flex; flex-direction: column; }
+
+  /* Auth Screens */
+  .auth-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    overflow-y: auto;
+  }
+  .auth-card {
+    width: 100%;
+    max-width: 420px;
+    text-align: center;
+  }
+  .lock-icon {
+    font-size: 72px;
+    margin-bottom: 16px;
+    filter: drop-shadow(0 2px 8px rgba(0,122,255,0.3));
+  }
+  .auth-title { font-size: 24px; font-weight: 600; margin-bottom: 8px; }
+  .auth-desc {
+    color: var(--text-secondary);
+    font-size: 14px;
+    margin-bottom: 28px;
+    line-height: 1.5;
+    white-space: pre-line;
+  }
+  .form-group { margin-bottom: 14px; text-align: left; }
+  .form-input {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+    font-family: inherit;
+    margin-bottom: 12px;
+  }
+  .form-input:focus { border-color: var(--primary); background: var(--bg); }
+  .form-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 14px 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .form-checkbox input {
+    width: 16px; height: 16px;
+    accent-color: var(--primary);
+    cursor: pointer;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .btn-primary {
+    background: var(--primary);
+    color: #fff;
+    width: 100%;
+    padding: 11px 20px;
+    font-size: 15px;
+  }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-secondary {
+    background: var(--bg);
+    color: var(--primary);
+    border: 1px solid var(--primary);
+  }
+  .btn-secondary:hover { background: rgba(0,122,255,0.05); }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    padding: 8px 12px;
+  }
+  .btn-ghost:hover { background: var(--hover); color: var(--text); }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-danger:hover { opacity: 0.9; }
+  .btn-outline { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+  .btn-outline:hover { background: var(--hover); }
+  .error-text {
+    color: var(--danger);
+    font-size: 13px;
+    margin-bottom: 10px;
+    text-align: left;
+    min-height: 18px;
+  }
+  .link-btn {
+    background: none;
+    border: none;
+    color: var(--primary);
+    font-size: 13px;
+    cursor: pointer;
+    padding: 4px;
+    margin-top: 12px;
+    font-family: inherit;
+  }
+  .link-btn:hover { text-decoration: underline; }
+  .auth-divider {
+    display: flex;
+    align-items: center;
+    margin: 16px 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+  .auth-divider::before, .auth-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border-light);
+  }
+  .auth-divider span { padding: 0 12px; }
+  .bio-btn {
+    width: 100%;
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border-light);
+  }
+  .bio-btn:hover { background: var(--hover); }
+
+  .recovery-code-box {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin: 16px 0;
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 18px;
+    letter-spacing: 2px;
+    font-weight: 600;
+    color: var(--primary);
+    word-break: break-all;
+    user-select: all;
+    -webkit-user-select: all;
+  }
+  .recovery-warning {
+    font-size: 13px;
+    color: var(--danger);
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+
+  /* Main Interface */
+  .topbar {
+    display: flex;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-light);
+    gap: 12px;
+    background: var(--bg);
+    -webkit-app-region: drag;
+    min-height: 52px;
+  }
+  .topbar > * { -webkit-app-region: no-drag; }
+  .topbar-left { display: flex; align-items: center; gap: 8px; min-width: 180px; }
+  .topbar-title { font-size: 15px; font-weight: 600; }
+  .topbar-shield { font-size: 20px; }
+  .topbar-center { flex: 1; display: flex; justify-content: center; }
+  .search-box { width: 100%; max-width: 360px; position: relative; }
+  .search-input {
+    width: 100%;
+    padding: 7px 12px 7px 32px;
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+    font-family: inherit;
+  }
+  .search-input:focus { border-color: var(--primary); background: var(--bg); }
+  .search-icon {
+    position: absolute;
+    left: 10px; top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 180px;
+    justify-content: flex-end;
+  }
+  .count-label { font-size: 12px; color: var(--text-secondary); }
+  .icon-btn {
+    width: 32px; height: 32px;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    transition: background 0.15s;
+    font-family: inherit;
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn.active { background: var(--selected); color: var(--primary); }
+  .lock-btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+  }
+  .lock-btn:hover { background: var(--hover); }
+
+  .sort-bar {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border-light);
+    gap: 10px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+  .sort-label { color: var(--text-secondary); margin-right: 4px; }
+  .seg-group {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .seg-btn {
+    padding: 4px 12px;
+    background: var(--bg);
+    border: none;
+    border-right: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+  }
+  .seg-btn:last-child { border-right: none; }
+  .seg-btn.active { background: var(--bg-secondary); color: var(--text); font-weight: 500; }
+  .seg-btn:hover:not(.active) { background: var(--hover); }
+
+  .action-bar {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    background: var(--selected);
+    border-bottom: 1px solid var(--border-light);
+    gap: 8px;
+    font-size: 13px;
+  }
+  .action-bar-spacer { flex: 1; }
+  .action-bar .btn { padding: 5px 14px; font-size: 13px; border-radius: 6px; }
+
+  .list-container {
+    flex: 1;
+    overflow-y: auto;
+    position: relative;
+  }
+  .list-container.drag-over {
+    outline: 3px dashed var(--primary);
+    outline-offset: -8px;
+    background: rgba(0,122,255,0.03);
+  }
+  .drag-hint {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 16px;
+    color: var(--primary);
+    font-weight: 500;
+    pointer-events: none;
+    background: var(--bg);
+    padding: 12px 24px;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,122,255,0.2);
+  }
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    padding: 40px;
+  }
+  .empty-icon { font-size: 64px; margin-bottom: 16px; opacity: 0.6; }
+  .empty-text { font-size: 15px; margin-bottom: 8px; color: var(--text); }
+  .empty-sub { font-size: 13px; color: var(--text-secondary); }
+  .no-results {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+  }
+  .no-results-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+
+  .file-item {
+    display: flex;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-light);
+    cursor: default;
+    transition: background 0.1s;
+    gap: 10px;
+  }
+  .file-item:hover { background: var(--hover); }
+  .file-item.selected { background: var(--selected); }
+  .file-checkbox {
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    background: var(--bg);
+    transition: all 0.15s;
+    font-size: 11px;
+    color: transparent;
+  }
+  .file-checkbox.checked {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+  }
+  .file-icon {
+    font-size: 28px;
+    flex-shrink: 0;
+    width: 36px;
+    text-align: center;
+  }
+  .file-icon.folder { color: var(--primary); }
+  .file-icon.file { color: var(--text-secondary); }
+  .file-info { flex: 1; min-width: 0; }
+  .file-name {
+    font-weight: 500;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .file-meta { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+  .file-actions {
+    display: flex;
+    gap: 2px;
+    opacity: 0;
+    transition: opacity 0.15s;
+    flex-shrink: 0;
+  }
+  .file-item:hover .file-actions { opacity: 1; }
+  .file-action-btn {
+    width: 28px; height: 28px;
+    border: none;
+    background: transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: inherit;
+  }
+  .file-action-btn:hover { background: var(--border-light); color: var(--text); }
+  .file-action-btn.danger:hover { color: var(--danger); }
+
+  .footer-error {
+    padding: 8px 16px;
+    background: #FFF3F3;
+    color: var(--danger);
+    font-size: 13px;
+    border-top: 1px solid #FFD7D7;
+    display: none;
+  }
+  @media (prefers-color-scheme: dark) {
+    .footer-error { background: #3A1C1C; border-top-color: #5A2A2A; }
+  }
+  .footer-error.visible { display: block; }
+
+  .toast-container {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+  }
+  .toast {
+    background: rgba(52, 199, 89, 0.95);
+    color: #fff;
+    padding: 10px 18px;
+    border-radius: 20px;
+    font-size: 13px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    animation: toast-in 0.3s ease-out;
+    pointer-events: auto;
+  }
+  .toast.error { background: rgba(255, 59, 48, 0.95); }
+  @keyframes toast-in { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    animation: fade-in 0.15s;
+  }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  .modal {
+    background: var(--bg);
+    border-radius: 12px;
+    padding: 24px;
+    width: 90%;
+    max-width: 400px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  .modal-title { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .modal-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 18px;
+    line-height: 1.5;
+  }
+  .modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 20px;
+  }
+  .modal-actions .btn { padding: 8px 18px; font-size: 13px; }
+
+  .context-menu, .dropdown-menu {
+    position: fixed;
+    background: var(--bg);
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 4px;
+    min-width: 180px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+    z-index: 2000;
+    display: none;
+  }
+  .context-menu.visible, .dropdown-menu.visible { display: block; }
+  .context-menu-item, .dropdown-item, .submenu-item {
+    padding: 7px 14px;
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .context-menu-item:hover, .dropdown-item:hover, .submenu-item:hover { background: var(--hover); }
+  .context-menu-item.danger, .dropdown-item.danger { color: var(--danger); }
+  .context-menu-sep, .menu-sep {
+    height: 1px;
+    background: var(--border-light);
+    margin: 4px 0;
+  }
+  .dropdown-item { justify-content: space-between; }
+  .dropdown-submenu-indicator { color: var(--text-secondary); font-size: 11px; }
+  .dropdown-item.has-submenu { position: relative; }
+  .submenu {
+    position: absolute;
+    left: 100%;
+    top: 0;
+    background: var(--bg);
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 4px;
+    min-width: 140px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+    display: none;
+  }
+  .dropdown-item.has-submenu:hover .submenu { display: block; }
+  .submenu-item.active { color: var(--primary); font-weight: 500; }
+
+  .steps { display: flex; justify-content: center; gap: 8px; margin-bottom: 20px; }
+  .step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+  .step-dot.active { background: var(--primary); }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div class="context-menu" id="contextMenu">
+  <div class="context-menu-item" data-action="open">👁 打开</div>
+  <div class="context-menu-item" data-action="export">⤴ 导出</div>
+  <div class="context-menu-item" data-action="restore">↩ 还原到原位置</div>
+  <div class="context-menu-sep"></div>
+  <div class="context-menu-item danger" data-action="delete">🗑 删除</div>
+</div>
+
+<div class="dropdown-menu" id="gearMenu">
+  <div class="dropdown-item" data-action="changepw">🔒 修改密码…</div>
+  <div class="dropdown-item has-submenu" data-action="autolock">
+    <span>⏱ 自动锁定</span>
+    <span class="dropdown-submenu-indicator">▶</span>
+    <div class="submenu" id="autoLockSubmenu">
+      <div class="submenu-item" data-val="0">关闭</div>
+      <div class="submenu-item" data-val="1">1 分钟</div>
+      <div class="submenu-item" data-val="3">3 分钟</div>
+      <div class="submenu-item" data-val="5">5 分钟</div>
+      <div class="submenu-item" data-val="10">10 分钟</div>
+      <div class="submenu-item" data-val="30">30 分钟</div>
+    </div>
+  </div>
+  <div class="menu-sep"></div>
+  <div class="dropdown-item danger" data-action="reset">🗑 清空保险箱…</div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+'use strict';
+
+// ===== Tauri API =====
+const TAURI = window.__TAURI__;
+const invoke = TAURI.core.invoke;
+const listen = TAURI.event.listen;
+
+// ===== State =====
+const state = {
+  screen: 'loading',
+  entries: [],
+  filteredEntries: [],
+  selectedIds: new Set(),
+  multiSelectMode: false,
+  searchQuery: '',
+  sortBy: 'time',
+  sortAsc: false,
+  hasSavedPassword: false,
+  autoLockMinutes: 5,
+  idleTimer: null,
+  lastActivity: Date.now(),
+  contextMenuTargetId: null,
+  pendingRecoveryCode: '',
+  recoveryStep: 1,
+  recoveryCodeInput: '',
+  modalOpen: false,
+};
+
+// ===== Utility =====
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+    else if (k === 'html') e.innerHTML = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024*1024)).toFixed(1) + ' MB';
+  return (bytes / (1024*1024*1024)).toFixed(2) + ' GB';
+}
+
+function formatDate(ts) {
+  const d = new Date(ts);
+  try {
+    return new Intl.DateTimeFormat('zh-CN', { year:'numeric', month:'long', day:'numeric', hour:'numeric', minute:'2-digit', hour12: true }).format(d);
+  } catch {
+    return d.toLocaleString('zh-CN');
+  }
+}
+
+function getCategory(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (['jpg','jpeg','png','gif','bmp','webp','svg','heic','tiff','ico'].includes(ext)) return '图片';
+  if (['mp4','mov','avi','mkv','flv','wmv','webm','m4v'].includes(ext)) return '视频';
+  if (['mp3','wav','flac','aac','ogg','m4a','wma'].includes(ext)) return '音频';
+  if (['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','rtf','md','pages','numbers','key'].includes(ext)) return '文档';
+  if (['zip','rar','7z','tar','gz','bz2'].includes(ext)) return '压缩包';
+  if (['js','ts','jsx','tsx','py','java','c','cpp','h','rs','go','swift','html','css','json','xml','yml','yaml'].includes(ext)) return '代码';
+  return '其他';
+}
+
+function showToast(msg, isError = false) {
+  const container = $('#toastContainer');
+  const t = el('div', { class: 'toast' + (isError ? ' error' : '') }, msg);
+  container.appendChild(t);
+  setTimeout(() => {
+    t.style.transition = 'opacity 0.3s, transform 0.3s';
+    t.style.opacity = '0';
+    t.style.transform = 'translateY(-10px)';
+    setTimeout(() => t.remove(), 300);
+  }, 2500);
+}
+function showError(msg) { showToast(msg, true); }
+
+// ===== Idle Auto-Lock =====
+function resetIdleTimer() { state.lastActivity = Date.now(); }
+function startIdleMonitor() {
+  if (state.idleTimer) clearInterval(state.idleTimer);
+  state.idleTimer = setInterval(() => {
+    if (state.screen !== 'main') return;
+    const mins = state.autoLockMinutes;
+    if (mins <= 0) return;
+    if (Date.now() - state.lastActivity >= mins * 60 * 1000) doLock();
+  }, 5000);
+}
+['mousemove','keydown','click','scroll','touchstart'].forEach(evt => {
+  window.addEventListener(evt, resetIdleTimer, true);
+});
+
+// ===== Rendering =====
+function render() {
+  const app = $('#app');
+  app.innerHTML = '';
+  hideAllMenus();
+  switch (state.screen) {
+    case 'loading': app.appendChild(renderLoading()); break;
+    case 'setup': app.appendChild(renderSetup()); break;
+    case 'unlock': app.appendChild(renderUnlock()); break;
+    case 'main': app.appendChild(renderMain()); setupDragDrop(); break;
+    case 'recovery-code': app.appendChild(renderRecoveryCode()); break;
+    case 'recovery-flow': app.appendChild(renderRecoveryFlow()); break;
+  }
+}
+
+function renderLoading() {
+  return el('div', { class: 'auth-container' },
+    el('div', { class: 'auth-card' }, [
+      el('div', { class: 'lock-icon' }, '🔒'),
+      el('div', { class: 'auth-title' }, '文件保险箱'),
+      el('div', { class: 'auth-desc' }, '正在检查保险箱状态…')
+    ])
+  );
+}
+
+function renderSetup() {
+  const container = el('div', { class: 'auth-container' });
+  const card = el('div', { class: 'auth-card' });
+  const errDiv = el('div', { class: 'error-text' });
+  const pwd1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置密码（至少4位）' });
+  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认密码' });
+  const rememberCb = el('input', { type: 'checkbox', checked: 'checked' });
+  let submitting = false;
+
+  const submit = async () => {
+    if (submitting) return;
+    const p1 = pwd1.value, p2 = pwd2.value;
+    const rem = rememberCb.checked;
+    errDiv.textContent = '';
+    if (p1.length < 4) { errDiv.textContent = '密码至少4位'; return; }
+    if (p1 !== p2) { errDiv.textContent = '两次密码不一致'; return; }
+    submitting = true;
+    btn.disabled = true; btn.textContent = '创建中…';
+    try {
+      const code = await invoke('setup_password', { password: p1, remember: rem, useBiometry: rem });
+      state.pendingRecoveryCode = code;
+      state.entries = [];
+      state.screen = 'recovery-code';
+      render();
+    } catch (e) {
+      errDiv.textContent = e || '创建失败';
+      btn.disabled = false; btn.textContent = '创建并解锁';
+      submitting = false;
+    }
+  };
+  pwd1.addEventListener('keydown', e => { if (e.key === 'Enter') pwd2.focus(); });
+  pwd2.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  const btn = el('button', { class: 'btn btn-primary', onclick: submit }, '创建并解锁');
+
+  card.append(
+    el('div', { class: 'lock-icon' }, '🔒'),
+    el('div', { class: 'auth-title' }, '设置保险箱密码'),
+    el('div', { class: 'auth-desc' }, '密码用于加密您的文件，请妥善保管。\n忘记密码时可使用恢复码重置。'),
+    pwd1, pwd2,
+    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码并启用 Touch ID']),
+    errDiv, btn
+  );
+  container.appendChild(card);
+  setTimeout(() => pwd1.focus(), 50);
+  return container;
+}
+
+function renderUnlock() {
+  const container = el('div', { class: 'auth-container' });
+  const card = el('div', { class: 'auth-card' });
+  const errDiv = el('div', { class: 'error-text' });
+  const pwd = el('input', { type: 'password', class: 'form-input', placeholder: '输入密码' });
+  const rememberCb = el('input', { type: 'checkbox' });
+
+  const doUnlock = async () => {
+    const p = pwd.value;
+    errDiv.textContent = '';
+    if (!p) { errDiv.textContent = '请输入密码'; return; }
+    try {
+      const entries = await invoke('unlock', { password: p, remember: rememberCb.checked, useBiometry: false });
+      state.entries = entries;
+      enterMain();
+    } catch (e) { errDiv.textContent = e || '解锁失败'; }
+  };
+  const doBiometricUnlock = async () => {
+    errDiv.textContent = '';
+    try {
+      const entries = await invoke('biometric_unlock');
+      state.entries = entries;
+      enterMain();
+    } catch (e) { errDiv.textContent = e || '生物识别解锁失败'; }
+  };
+  const goRecovery = () => {
+    state.recoveryStep = 1;
+    state.recoveryCodeInput = '';
+    state.screen = 'recovery-flow';
+    render();
+  };
+  pwd.addEventListener('keydown', e => { if (e.key === 'Enter') doUnlock(); });
+
+  card.append(
+    el('div', { class: 'lock-icon' }, '🔓'),
+    el('div', { class: 'auth-title' }, '输入密码解锁'),
+    pwd,
+    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码']),
+    errDiv,
+    el('button', { class: 'btn btn-primary', onclick: doUnlock }, '解锁')
+  );
+  if (state.hasSavedPassword) {
+    card.append(
+      el('div', { class: 'auth-divider' }, el('span', {}, '或')),
+      el('button', { class: 'btn bio-btn', onclick: doBiometricUnlock }, '👆 使用 Touch ID 解锁')
+    );
+  }
+  card.append(el('button', { class: 'link-btn', onclick: goRecovery }, '忘记密码？用恢复码找回'));
+  container.appendChild(card);
+  setTimeout(() => pwd.focus(), 50);
+  return container;
+}
+
+function renderRecoveryCode() {
+  const container = el('div', { class: 'auth-container' });
+  const card = el('div', { class: 'auth-card' });
+  const copyBtn = el('button', {
+    class: 'btn btn-secondary',
+    style: 'margin-bottom:12px;',
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(state.pendingRecoveryCode);
+        showToast('恢复码已复制');
+      } catch { showToast('复制失败，请手动复制', true); }
+    }
+  }, '📋 复制恢复码');
+  const done = () => { state.pendingRecoveryCode = ''; enterMain(); };
+
+  card.append(
+    el('div', { class: 'lock-icon' }, '🛡️'),
+    el('div', { class: 'auth-title' }, '请保存您的恢复码'),
+    el('div', { class: 'auth-desc' }, '如果忘记密码，您可以使用此恢复码重置密码。'),
+    el('div', { class: 'recovery-warning' }, '⚠️ 恢复码只显示一次！请务必抄写或截图保存在安全的地方，丢失将无法找回。'),
+    el('div', { class: 'recovery-code-box' }, state.pendingRecoveryCode),
+    copyBtn,
+    el('button', { class: 'btn btn-primary', onclick: done }, '我已保存，进入保险箱')
+  );
+  container.appendChild(card);
+  return container;
+}
+
+function renderRecoveryFlow() {
+  const container = el('div', { class: 'auth-container' });
+  const card = el('div', { class: 'auth-card' });
+  const steps = el('div', { class: 'steps' });
+  for (let i = 1; i <= 3; i++) steps.appendChild(el('div', { class: 'step-dot' + (i <= state.recoveryStep ? ' active' : '') }));
+  const errDiv = el('div', { class: 'error-text' });
+
+  if (state.recoveryStep === 1) {
+    const codeInput = el('input', { class: 'form-input', placeholder: '请输入恢复码' });
+    codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') next(); });
+    const next = () => {
+      if (!codeInput.value.trim()) { errDiv.textContent = '请输入恢复码'; return; }
+      state.recoveryCodeInput = codeInput.value.trim();
+      state.recoveryStep = 2;
+      render();
+    };
+    card.append(
+      el('div', { class: 'lock-icon' }, '🔑'),
+      el('div', { class: 'auth-title' }, '使用恢复码重置'),
+      el('div', { class: 'auth-desc' }, '第 1 步：输入您保存的恢复码'),
+      steps, codeInput, errDiv,
+      el('button', { class: 'btn btn-primary', onclick: next }, '下一步'),
+      el('br'),
+      el('button', { class: 'link-btn', onclick: () => { state.screen = 'unlock'; render(); } }, '返回解锁')
+    );
+    setTimeout(() => codeInput.focus(), 50);
+  } else if (state.recoveryStep === 2) {
+    const p1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置新密码（至少4位）' });
+    const p2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认新密码' });
+    p1.addEventListener('keydown', e => { if (e.key === 'Enter') p2.focus(); });
+    const next = async () => {
+      errDiv.textContent = '';
+      if (p1.value.length < 4) { errDiv.textContent = '密码至少4位'; return; }
+      if (p1.value !== p2.value) { errDiv.textContent = '两次密码不一致'; return; }
+      try {
+        const code = await invoke('recover_password', { recoveryCode: state.recoveryCodeInput, newPassword: p1.value });
+        state.pendingRecoveryCode = code;
+        state.recoveryStep = 3;
+        render();
+      } catch (e) { errDiv.textContent = e || '恢复失败，请检查恢复码'; }
+    };
+    p2.addEventListener('keydown', e => { if (e.key === 'Enter') next(); });
+    card.append(
+      el('div', { class: 'lock-icon' }, '🔒'),
+      el('div', { class: 'auth-title' }, '设置新密码'),
+      el('div', { class: 'auth-desc' }, '第 2 步：设置新的保险箱密码'),
+      steps, p1, p2, errDiv,
+      el('button', { class: 'btn btn-primary', onclick: next }, '确认重置')
+    );
+    setTimeout(() => p1.focus(), 50);
+  } else {
+    const copyBtn = el('button', {
+      class: 'btn btn-secondary', style: 'margin-bottom:12px;',
+      onclick: async () => {
+        try { await navigator.clipboard.writeText(state.pendingRecoveryCode); showToast('已复制'); } catch {}
+      }
+    }, '📋 复制');
+    const done = async () => {
+      try {
+        const entries = await invoke('list_entries');
+        state.entries = entries;
+        state.pendingRecoveryCode = '';
+        state.recoveryStep = 1;
+        enterMain();
+      } catch {
+        state.screen = 'unlock';
+        render();
+      }
+    };
+    card.append(
+      el('div', { class: 'lock-icon' }, '✅'),
+      el('div', { class: 'auth-title' }, '密码重置成功'),
+      el('div', { class: 'auth-desc' }, '第 3 步：请保存新的恢复码'),
+      el('div', { class: 'recovery-warning' }, '⚠️ 旧恢复码已失效，请妥善保存新恢复码。'),
+      steps,
+      el('div', { class: 'recovery-code-box' }, state.pendingRecoveryCode),
+      copyBtn,
+      el('button', { class: 'btn btn-primary', onclick: done }, '我已保存')
+    );
+  }
+  container.appendChild(card);
+  return container;
+}
+
+// ===== Main Screen =====
+function enterMain() {
+  state.screen = 'main';
+  state.multiSelectMode = false;
+  state.selectedIds.clear();
+  state.searchQuery = '';
+  state.sortBy = 'time';
+  state.sortAsc = false;
+  resetIdleTimer();
+  render();
+}
+
+function renderMain() {
+  const wrapper = el('div', { style: 'display:flex;flex-direction:column;height:100%;' });
+  applyFilterAndSort();
+  const totalCount = state.entries.length;
+  const selectedCount = state.selectedIds.size;
+
+  // Top bar
+  const topbar = el('div', { class: 'topbar' });
+  const left = el('div', { class: 'topbar-left' }, [
+    el('span', { class: 'topbar-shield' }, '🛡️'),
+    el('span', { class: 'topbar-title' }, '文件保险箱')
+  ]);
+  const searchInput = el('input', {
+    type: 'text', class: 'search-input',
+    placeholder: '搜索文件…', value: state.searchQuery
+  });
+  searchInput.addEventListener('input', e => {
+    state.searchQuery = e.target.value;
+    const list = $('#listContainer');
+    if (list) renderListInto(list);
+    updateCountLabel();
+  });
+  const center = el('div', { class: 'topbar-center' }, [
+    el('div', { class: 'search-box' }, [
+      el('span', { class: 'search-icon' }, '🔍'),
+      searchInput
+    ])
+  ]);
+  const countLabel = el('span', { class: 'count-label', id: 'countLabel' });
+  const multiBtn = el('button', {
+    class: 'icon-btn' + (state.multiSelectMode ? ' active' : ''),
+    title: '多选',
+    onclick: () => {
+      state.multiSelectMode = !state.multiSelectMode;
+      if (!state.multiSelectMode) state.selectedIds.clear();
+      render();
+    }
+  }, '☑️');
+  const gearBtn = el('button', {
+    class: 'icon-btn', title: '设置',
+    onclick: e => toggleGearMenu(e)
+  }, '⚙️');
+  const lockBtnEl = el('button', { class: 'lock-btn', onclick: doLock }, '🔒 锁定');
+  const right = el('div', { class: 'topbar-right' }, [countLabel, multiBtn, gearBtn, lockBtnEl]);
+  topbar.append(left, center, right);
+
+  // Sort bar (only when there are files)
+  const sortBar = el('div', { class: 'sort-bar', id: 'sortBar', style: totalCount > 0 ? '' : 'display:none;' });
+  sortBar.append(el('span', { class: 'sort-label' }, '排序：'));
+  const segGroup = el('div', { class: 'seg-group' });
+  for (const [key, label] of [['category','分类'],['time','时间'],['size','大小']]) {
+    segGroup.appendChild(el('button', {
+      class: 'seg-btn' + (state.sortBy === key ? ' active' : ''),
+      onclick: () => {
+        if (state.sortBy === key) state.sortAsc = !state.sortAsc;
+        else { state.sortBy = key; state.sortAsc = false; }
+        render();
+      }
+    }, label));
+  }
+  sortBar.appendChild(segGroup);
+  sortBar.appendChild(el('button', {
+    class: 'icon-btn',
+    title: state.sortAsc ? '升序' : '降序',
+    style: 'margin-left:4px;width:28px;height:28px;font-size:13px;',
+    onclick: () => { state.sortAsc = !state.sortAsc; render(); }
+  }, state.sortAsc ? '↑' : '↓'));
+
+  // Action bar
+  const actionBar = el('div', {
+    class: 'action-bar',
+    style: state.multiSelectMode && selectedCount > 0 ? '' : 'display:none;'
+  });
+  actionBar.append(
+    el('span', {}, `已选 ${selectedCount} 项`),
+    el('div', { class: 'action-bar-spacer' }),
+    el('button', { class: 'btn btn-danger', onclick: deleteSelected }, '🗑 删除'),
+    el('button', { class: 'btn btn-outline', onclick: exportSelected }, '⤴ 导出'),
+    el('button', {
+      class: 'btn btn-ghost',
+      onclick: () => { state.selectedIds.clear(); render(); }
+    }, '取消选择')
+  );
+
+  const listContainer = el('div', { class: 'list-container', id: 'listContainer' });
+  wrapper.append(topbar, sortBar, actionBar, listContainer);
+
+  updateCountLabel();
+  setTimeout(() => renderListInto(listContainer), 0);
+  return wrapper;
+}
+
+function updateCountLabel() {
+  const label = $('#countLabel');
+  if (!label) return;
+  const total = state.entries.length;
+  const sel = state.selectedIds.size;
+  label.textContent = state.multiSelectMode && sel > 0 ? `已选 ${sel}/${total}` : `共 ${total} 项`;
+}
+
+function applyFilterAndSort() {
+  let list = state.entries.slice();
+  const q = state.searchQuery.trim().toLowerCase();
+  if (q) list = list.filter(e => e.name.toLowerCase().includes(q));
+  list.sort((a, b) => {
+    let cmp = 0;
+    if (state.sortBy === 'category') {
+      cmp = getCategory(a.name).localeCompare(getCategory(b.name), 'zh-CN');
+      if (cmp === 0) cmp = a.name.localeCompare(b.name, 'zh-CN');
+    } else if (state.sortBy === 'size') {
+      cmp = a.size - b.size;
+    } else {
+      cmp = a.added_at - b.added_at;
+    }
+    return state.sortAsc ? cmp : -cmp;
+  });
+  state.filteredEntries = list;
+}
+
+function renderListInto(container) {
+  container.innerHTML = '';
+  applyFilterAndSort();
+  if (state.entries.length === 0) {
+    container.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-icon' }, '🛡️'),
+      el('div', { class: 'empty-text' }, '拖拽文件或文件夹到此处加密存入'),
+      el('div', { class: 'empty-sub' }, '文件将被 AES-256-GCM 加密，仅可通过密码访问')
+    ]));
+    return;
+  }
+  if (state.filteredEntries.length === 0) {
+    container.appendChild(el('div', { class: 'no-results' }, [
+      el('div', { class: 'no-results-icon' }, '🔍'),
+      el('div', {}, '没有找到匹配的文件')
+    ]));
+    return;
+  }
+  for (const entry of state.filteredEntries) {
+    container.appendChild(renderFileItem(entry));
+  }
+}
+
+function renderFileItem(entry) {
+  const isFolder = entry.kind === 'folder';
+  const isSelected = state.selectedIds.has(entry.id);
+  const category = getCategory(entry.name);
+  const row = el('div', {
+    class: 'file-item' + (isSelected ? ' selected' : ''),
+    'data-id': entry.id,
+    draggable: 'true'
+  });
+  if (state.multiSelectMode) {
+    row.appendChild(el('div', {
+      class: 'file-checkbox' + (isSelected ? ' checked' : ''),
+      onclick: e => { e.stopPropagation(); toggleSelect(entry.id); }
+    }, isSelected ? '✓' : ''));
+  }
+  row.appendChild(el('div', { class: 'file-icon ' + (isFolder ? 'folder' : 'file') }, isFolder ? '📁' : '📄'));
+  const meta = `${category} · ${formatSize(entry.size)} · ${formatDate(entry.added_at)}`;
+  row.appendChild(el('div', { class: 'file-info' }, [
+    el('div', { class: 'file-name', title: entry.name }, entry.name),
+    el('div', { class: 'file-meta' }, meta)
+  ]));
+  const actions = el('div', { class: 'file-actions' });
+  const mkBtn = (emoji, title, handler, danger) => actions.appendChild(el('button', {
+    class: 'file-action-btn' + (danger ? ' danger' : ''),
+    title, onclick: e => { e.stopPropagation(); handler(); }
+  }, emoji));
+  mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
+  mkBtn('👁', '打开', () => openEntry(entry.id));
+  mkBtn('⤴', '导出', () => exportEntry(entry));
+  mkBtn('🗑', '删除', () => deleteEntry(entry), true);
+  row.appendChild(actions);
+
+  row.addEventListener('click', e => {
+    if (e.target.closest('.file-actions') || e.target.closest('.file-checkbox')) return;
+    if (state.multiSelectMode) toggleSelect(entry.id);
+    else openEntry(entry.id);
+  });
+  row.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    state.contextMenuTargetId = entry.id;
+    showContextMenu(e.clientX, e.clientY);
+  });
+  row.addEventListener('dragstart', async e => {
+    try {
+      const path = await invoke('temporary_export_url', { id: entry.id });
+      e.dataTransfer.setData('text/uri-list', 'file://' + path);
+      e.dataTransfer.effectAllowed = 'copy';
+    } catch (err) { showError('拖拽失败: ' + err); }
+  });
+  return row;
+}
+
+function toggleSelect(id) {
+  if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+  else state.selectedIds.add(id);
+  render();
+}
+
+// ---- File ops ----
+async function openEntry(id) {
+  try { await invoke('open_entry', { id }); }
+  catch (e) { showError('打开失败: ' + e); }
+}
+
+async function exportEntry(entry) {
+  try {
+    let savePath = null;
+    if (TAURI.dialog && TAURI.dialog.save) {
+      savePath = await TAURI.dialog.save({ defaultPath: entry.name, title: '导出文件' }).catch(() => null);
+    }
+    if (!savePath) return;
+    await invoke('export_entry', { id: entry.id, targetPath: savePath });
+    showToast('导出成功');
+  } catch (e) { showError('导出失败: ' + e); }
+}
+
+async function exportSelected() {
+  const ids = Array.from(state.selectedIds);
+  if (ids.length === 0) return;
+  try {
+    let dir = null;
+    if (TAURI.dialog && TAURI.dialog.open) {
+      dir = await TAURI.dialog.open({ directory: true, title: '选择导出目录', multiple: false }).catch(() => null);
+    }
+    if (!dir) return;
+    const targetDir = typeof dir === 'string' ? dir : (Array.isArray(dir) ? dir[0] : null);
+    if (!targetDir) return;
+    await invoke('export_entries_to_dir', { ids, dir: targetDir });
+    showToast(`已导出 ${ids.length} 项`);
+    state.selectedIds.clear();
+    state.multiSelectMode = false;
+    render();
+  } catch (e) { showError('导出失败: ' + e); }
+}
+
+async function restoreEntry(id) {
+  try {
+    await invoke('restore_entry', { id });
+    state.entries = await invoke('list_entries');
+    showToast('已还原到原位置');
+    render();
+  } catch (e) { showError('还原失败: ' + e); }
+}
+
+async function deleteEntry(entry) {
+  showConfirm(`确定要删除「${entry.name}」吗？文件将被移入废纸篓。`, async () => {
+    try {
+      await invoke('delete_entry', { id: entry.id });
+      state.entries = await invoke('list_entries');
+      state.selectedIds.delete(entry.id);
+      showToast('已删除');
+      render();
+    } catch (e) { showError('删除失败: ' + e); }
+  });
+}
+
+async function deleteSelected() {
+  const ids = Array.from(state.selectedIds);
+  if (ids.length === 0) return;
+  showConfirm(`确定要删除选中的 ${ids.length} 项吗？`, async () => {
+    try {
+      await invoke('delete_entries', { ids });
+      state.entries = await invoke('list_entries');
+      state.selectedIds.clear();
+      state.multiSelectMode = false;
+      showToast('已删除');
+      render();
+    } catch (e) { showError('删除失败: ' + e); }
+  });
+}
+
+async function doLock() {
+  try { await invoke('lock'); } catch {}
+  state.entries = [];
+  state.selectedIds.clear();
+  state.multiSelectMode = false;
+  state.searchQuery = '';
+  state.screen = 'unlock';
+  render();
+}
+
+// ---- Drag & Drop into app ----
+function setupDragDrop() {
+  const container = $('#listContainer');
+  if (!container) return;
+  let dragDepth = 0;
+  container.addEventListener('dragenter', e => {
+    e.preventDefault();
+    dragDepth++;
+    container.classList.add('drag-over');
+    if (!container.querySelector('.drag-hint')) {
+      container.appendChild(el('div', { class: 'drag-hint' }, '松开以加入保险箱'));
+    }
+  });
+  container.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  container.addEventListener('dragleave', e => {
+    dragDepth--;
+    if (dragDepth <= 0) {
+      dragDepth = 0;
+      container.classList.remove('drag-over');
+      const hint = container.querySelector('.drag-hint');
+      if (hint) hint.remove();
+    }
+  });
+  container.addEventListener('drop', e => {
+    e.preventDefault();
+    dragDepth = 0;
+    container.classList.remove('drag-over');
+    const hint = container.querySelector('.drag-hint');
+    if (hint) hint.remove();
+  });
+}
+
+async function initDragDropListener() {
+  try {
+    await listen('tauri://drag-drop', async event => {
+      const urls = (event.payload && event.payload.urls) || [];
+      if (urls.length === 0) {
+        // fallback: try dataTransfer files
+        return;
+      }
+      const paths = urls.map(u => {
+        let p = u;
+        if (p.startsWith('file://')) {
+          p = decodeURIComponent(p.slice(7));
+          // On Windows file:///C:/...
+          if (p.startsWith('/') && /^[A-Za-z]:/.test(p.slice(1))) p = p.slice(1);
+        }
+        return p;
+      });
+      await addFilesByPaths(paths);
+    });
+  } catch {}
+}
+
+// Also listen for native HTML5 drop on document as fallback
+window.addEventListener('DOMContentLoaded', () => {
+  document.addEventListener('drop', async e => {
+    if (state.screen !== 'main') return;
+    // Only process if tauri event didn't catch it, check dataTransfer
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const paths = [];
+      for (let i = 0; i < e.dataTransfer.files.length; i++) {
+        const f = e.dataTransfer.files[i];
+        if (f.path) paths.push(f.path);
+      }
+      if (paths.length > 0) {
+        e.preventDefault();
+        await addFilesByPaths(paths);
+      }
+    }
+  });
+  document.addEventListener('dragover', e => {
+    if (state.screen === 'main') e.preventDefault();
+  });
+});
+
+async function addFilesByPaths(paths) {
+  try {
+    showToast(`正在添加 ${paths.length} 个文件…`);
+    const added = await invoke('add_files', { paths });
+    state.entries = await invoke('list_entries');
+    showToast(`已添加 ${added.length} 个文件`);
+    render();
+  } catch (e) { showError('添加失败: ' + e); }
+}
+
+// ---- Context menu ----
+function showContextMenu(x, y) {
+  const menu = $('#contextMenu');
+  menu.classList.add('visible');
+  const maxX = window.innerWidth - 200;
+  const maxY = window.innerHeight - 220;
+  menu.style.left = Math.min(x, maxX) + 'px';
+  menu.style.top = Math.min(y, maxY) + 'px';
+}
+function hideContextMenu() { $('#contextMenu').classList.remove('visible'); }
+
+function hideAllMenus() {
+  hideContextMenu();
+  const gm = $('#gearMenu');
+  if (gm) gm.classList.remove('visible');
+}
+
+document.addEventListener('click', e => {
+  const item = e.target.closest('.context-menu-item');
+  if (item) {
+    const action = item.dataset.action;
+    const id = state.contextMenuTargetId;
+    hideContextMenu();
+    if (!id) return;
+    const entry = state.entries.find(x => x.id === id);
+    if (!entry) return;
+    if (action === 'open') openEntry(id);
+    else if (action === 'export') exportEntry(entry);
+    else if (action === 'restore') restoreEntry(id);
+    else if (action === 'delete') deleteEntry(entry);
+    return;
+  }
+  if (!e.target.closest('#contextMenu')) hideContextMenu();
+
+  const gItem = e.target.closest('.dropdown-item');
+  if (gItem) {
+    const action = gItem.dataset.action;
+    if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
+    else if (action === 'reset') { hideGearMenu(); showResetConfirm(); }
+    return;
+  }
+  const sub = e.target.closest('.submenu-item');
+  if (sub) {
+    const val = parseInt(sub.dataset.val);
+    setAutoLock(val);
+    hideGearMenu();
+    return;
+  }
+  if (!e.target.closest('#gearMenu')) hideGearMenu();
+});
+
+// ---- Gear menu ----
+function toggleGearMenu(e) {
+  const menu = $('#gearMenu');
+  if (menu.classList.contains('visible')) { hideGearMenu(); return; }
+  const rect = e.currentTarget.getBoundingClientRect();
+  menu.classList.add('visible');
+  // Mark active
+  $$('#autoLockSubmenu .submenu-item').forEach(it => {
+    it.classList.toggle('active', parseInt(it.dataset.val) === state.autoLockMinutes);
+  });
+  const menuRect = menu.getBoundingClientRect();
+  let x = rect.right - menuRect.width;
+  let y = rect.bottom + 4;
+  if (y + menuRect.height > window.innerHeight) y = rect.top - menuRect.height - 4;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+function hideGearMenu() { $('#gearMenu').classList.remove('visible'); }
+
+async function setAutoLock(mins) {
+  try {
+    await invoke('set_auto_lock_minutes', { mins });
+    state.autoLockMinutes = mins;
+    showToast(mins === 0 ? '自动锁定已关闭' : `自动锁定：${mins} 分钟`);
+  } catch (e) { showError('设置失败: ' + e); }
+}
+
+// ---- Modals ----
+function showModal(contentEl) {
+  closeModal();
+  const overlay = el('div', { class: 'modal-overlay', id: 'modalOverlay' });
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
+  overlay.appendChild(contentEl);
+  document.body.appendChild(overlay);
+  state.modalOpen = true;
+}
+function closeModal() {
+  const o = $('#modalOverlay');
+  if (o) o.remove();
+  state.modalOpen = false;
+}
+
+function showConfirm(message, onConfirm) {
+  const modal = el('div', { class: 'modal' }, [
+    el('div', { class: 'modal-title' }, '确认操作'),
+    el('div', { class: 'modal-desc' }, message),
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
+      el('button', {
+        class: 'btn btn-danger',
+        onclick: () => { closeModal(); onConfirm(); }
+      }, '确定')
+    ])
+  ]);
+  showModal(modal);
+}
+
+function showChangePasswordModal() {
+  const errDiv = el('div', { class: 'error-text' });
+  const oldP = el('input', { type: 'password', class: 'form-input', placeholder: '当前密码' });
+  const newP = el('input', { type: 'password', class: 'form-input', placeholder: '新密码（至少4位）' });
+  const newP2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认新密码' });
+
+  const submit = async () => {
+    errDiv.textContent = '';
+    const o = oldP.value, n = newP.value, n2 = newP2.value;
+    if (!o) { errDiv.textContent = '请输入当前密码'; return; }
+    if (n.length < 4) { errDiv.textContent = '新密码至少4位'; return; }
+    if (n !== n2) { errDiv.textContent = '两次密码不一致'; return; }
+    try {
+      const code = await invoke('change_password', { old: o, new: n });
+      closeModal();
+      state.pendingRecoveryCode = code;
+      // show recovery code screen (in-modal style by switching screen)
+      const prevScreen = state.screen;
+      state.screen = 'recovery-code';
+      // Override: after save, go back to main
+      const origPending = state.pendingRecoveryCode;
+      render();
+    } catch (e) { errDiv.textContent = e || '修改失败'; }
+  };
+
+  oldP.addEventListener('keydown', e => { if (e.key === 'Enter') newP.focus(); });
+  newP.addEventListener('keydown', e => { if (e.key === 'Enter') newP2.focus(); });
+  newP2.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+
+  const modal = el('div', { class: 'modal' }, [
+    el('div', { class: 'modal-title' }, '修改密码'),
+    el('div', { class: 'modal-desc' }, '输入当前密码并设置新密码。修改成功后将生成新的恢复码。'),
+    oldP, newP, newP2,
+    errDiv,
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
+      el('button', { class: 'btn btn-primary', style: 'width:auto;padding:8px 20px;', onclick: submit }, '确认修改')
+    ])
+  ]);
+  showModal(modal);
+  setTimeout(() => oldP.focus(), 50);
+}
+
+function showResetConfirm() {
+  showConfirm('确定要清空保险箱吗？所有加密文件将被永久删除，此操作不可恢复！', async () => {
+    try {
+      await invoke('reset_vault');
+      state.entries = [];
+      state.hasSavedPassword = false;
+      state.screen = 'setup';
+      render();
+      showToast('保险箱已清空');
+    } catch (e) { showError('清空失败: ' + e); }
+  });
+}
+
+// ---- Init ----
+async function init() {
+  render();
+  try {
+    const exists = await invoke('vault_exists');
+    if (exists) {
+      state.hasSavedPassword = await invoke('has_saved_password');
+      state.screen = 'unlock';
+    } else {
+      state.screen = 'setup';
+    }
+    state.autoLockMinutes = await invoke('get_auto_lock_minutes');
+  } catch (e) {
+    state.screen = 'setup';
+  }
+  render();
+  startIdleMonitor();
+  initDragDropListener();
+}
+
+// Keyboard shortcut: Escape closes menus/modals
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    hideAllMenus();
+    if (state.modalOpen) closeModal();
+  }
+  // Cmd/Ctrl+L to lock
+  if ((e.metaKey || e.ctrlKey) && e.key === 'l' && state.screen === 'main') {
+    e.preventDefault();
+    doLock();
+  }
+});
+
+init();
+</script>
+</body>
+</html>

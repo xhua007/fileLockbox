@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认能力",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:default",
+    "os:default",
+    "shell:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "shell:allow-open"
+  ]
+}
