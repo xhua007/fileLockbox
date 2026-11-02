@@ -11,12 +11,14 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
 #[derive(Debug)]
 pub struct VaultManager {
     pub entries: Vec<VaultEntry>,
-    pub master_key: Option<[u8; 32]>,
+    /// 主密钥用 `Zeroizing` 包裹，离开作用域（含栈上临时副本）时自动清零。
+    pub master_key: Option<Zeroizing<[u8; 32]>>,
     pub is_unlocked: bool,
     pub data_base: PathBuf,
     pub current_vault_id: String,
@@ -256,13 +258,63 @@ fn vaults_path(data_base: &Path) -> PathBuf {
     data_base.join("vaults.json")
 }
 
+/// 生产构建下只保留文件名，避免错误信息把本机绝对路径暴露到前端或日志。
+fn redact_path(p: &Path) -> String {
+    if cfg!(debug_assertions) {
+        p.display().to_string()
+    } else {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<未知路径>".to_string())
+    }
+}
+
+/// 元数据文件头：存在则说明内容是 AES-GCM 密文（密钥来自系统钥匙串）。
+const META_MAGIC: &[u8] = b"FLCK_META\x01";
+
+/// 元数据加密密钥。单元测试中返回 `None`（回退明文），避免读写开发机真实钥匙串。
+fn metadata_key() -> Option<[u8; 32]> {
+    #[cfg(not(test))]
+    {
+        keychain::load_or_create_metadata_key().ok()
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+fn load_meta_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    if let Some(enc) = bytes.strip_prefix(META_MAGIC) {
+        let key = metadata_key()?;
+        let plain = crypto::decrypt(enc, &key).ok()?;
+        return serde_json::from_slice(&plain).ok();
+    }
+    // 兼容旧版明文文件
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 元数据落盘：钥匙串可用时加密，否则回退明文（保证应用仍可启动）。
+fn save_meta_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let json = serde_json::to_vec(value).map_err(|e| format!("序列化元数据失败: {e}"))?;
+    match metadata_key() {
+        Some(key) => {
+            let enc = crypto::encrypt(&json, &key)?;
+            let mut out = Vec::with_capacity(META_MAGIC.len() + enc.len());
+            out.extend_from_slice(META_MAGIC);
+            out.extend_from_slice(&enc);
+            atomic_write(path, &out)
+        }
+        None => atomic_write(path, &json),
+    }
+}
+
 fn load_vault_profiles(data_base: &Path) -> Vec<VaultProfile> {
     let p = vaults_path(data_base);
-    if let Ok(bytes) = fs::read(&p) {
-        if let Ok(profiles) = serde_json::from_slice::<Vec<VaultProfile>>(&bytes) {
-            if !profiles.is_empty() {
-                return profiles;
-            }
+    if let Some(profiles) = load_meta_json::<Vec<VaultProfile>>(&p) {
+        if !profiles.is_empty() {
+            return profiles;
         }
     }
 
@@ -273,16 +325,15 @@ fn load_vault_profiles(data_base: &Path) -> Vec<VaultProfile> {
         created_at: Utc::now().timestamp_millis(),
     };
     let profiles = vec![default_profile];
-    if let Ok(bytes) = serde_json::to_vec(&profiles) {
-        let _ = atomic_write(&p, &bytes);
+    // 文件存在但读不出来（例如钥匙串暂时不可用）时不要覆盖，避免把已加密的档案冲掉。
+    if !p.exists() {
+        let _ = save_vault_profiles(data_base, &profiles);
     }
     profiles
 }
 
 fn save_vault_profiles(data_base: &Path, profiles: &[VaultProfile]) -> Result<(), String> {
-    let p = vaults_path(data_base);
-    let bytes = serde_json::to_vec(profiles).map_err(|e| format!("序列化保险箱列表失败: {e}"))?;
-    atomic_write(&p, &bytes)
+    save_meta_json(&vaults_path(data_base), profiles)
 }
 
 fn vault_dir_for(data_base: &Path, id: &str) -> PathBuf {
@@ -443,12 +494,16 @@ impl VaultManager {
         }
     }
 
-    fn require_unlocked(&self) -> Result<[u8; 32], String> {
+    fn require_unlocked(&self) -> Result<Zeroizing<[u8; 32]>, String> {
         if !self.is_unlocked {
             return Err("保险箱尚未解锁".into());
         }
         self.touch();
-        self.master_key.ok_or_else(|| "主密钥缺失".into())
+        // 返回 `Zeroizing` 副本：调用方用完后栈上的字节会被自动清零，不会长期残留。
+        self.master_key
+            .as_ref()
+            .map(|k| Zeroizing::new(**k))
+            .ok_or_else(|| "主密钥缺失".into())
     }
 
     /// 首次设置密码：生成随机 master_key，用密码/恢复码分别包装后落盘。
@@ -492,7 +547,7 @@ impl VaultManager {
 
         // 空索引
         self.entries = Vec::new();
-        self.master_key = Some(master_key);
+        self.master_key = Some(Zeroizing::new(master_key));
         self.is_unlocked = true;
         self.failed_attempts = 0;
         self.lockout_until = None;
@@ -564,8 +619,8 @@ impl VaultManager {
             }
         };
 
-        self.master_key = Some(master_key);
         self.entries = self.load_index_with_key(&master_key)?;
+        self.master_key = Some(Zeroizing::new(master_key));
         self.is_unlocked = true;
         self.touch();
 
@@ -680,9 +735,7 @@ impl VaultManager {
     }
 
     pub fn lock(&mut self) {
-        if let Some(mut mk) = self.master_key.take() {
-            crypto::zeroize_slice(&mut mk);
-        }
+        // `Zeroizing` 在释放时自动清零，无需手动擦除。
         self.master_key = None;
         self.entries.clear();
         self.is_unlocked = false;
@@ -802,9 +855,7 @@ impl VaultManager {
         // 更新应用配置中的当前活跃保险箱
         let mut cfg = load_config(&self.config_path).unwrap_or_default();
         cfg.current_vault_id = Some(target.id.clone());
-        if let Ok(bytes) = serde_json::to_vec(&cfg) {
-            let _ = atomic_write(&self.config_path, &bytes);
-        }
+        let _ = save_meta_json(&self.config_path, &cfg);
 
         Ok(self.get_current_vault_info())
     }
@@ -921,7 +972,7 @@ impl VaultManager {
         for p_str in paths {
             let p = PathBuf::from(&p_str);
             if !p.exists() {
-                return Err(format!("文件不存在: {}", p_str));
+                return Err(format!("文件不存在: {}", redact_path(&p)));
             }
 
             // 从应用 tmp 目录拖入的文件（本应用临时解密出的副本）跳过。
@@ -936,7 +987,7 @@ impl VaultManager {
 
             let name = p
                 .file_name()
-                .ok_or_else(|| format!("路径无文件名: {}", p.display()))?
+                .ok_or_else(|| format!("路径无文件名: {}", redact_path(&p)))?
                 .to_string_lossy()
                 .to_string();
             let is_dir = p.is_dir();
@@ -1285,8 +1336,8 @@ impl VaultManager {
         if keychain::has_saved_password(&self.current_vault_id) {
             let _ = keychain::save_password(&self.current_vault_id, new_password);
         }
-        self.master_key = Some(mk);
         self.entries = self.load_index_with_key(&mk)?;
+        self.master_key = Some(Zeroizing::new(mk));
         self.is_unlocked = true;
         self.failed_attempts = 0;
         self.lockout_until = None;
@@ -1369,23 +1420,23 @@ impl VaultManager {
     }
 
     pub fn save_index(&self) -> Result<(), String> {
-        let mk = self.master_key.ok_or_else(|| "主密钥缺失".to_string())?;
+        let mk = self
+            .master_key
+            .as_ref()
+            .ok_or_else(|| "主密钥缺失".to_string())?;
         // 代次必须单调递增：以钥匙串锚点（其次现有索引）为基线 +1，
         // 这样即便攻击者把旧 index.enc / index.enc.bak 复制回来，也会因代次过小而拒绝加载。
-        let generation = self.current_index_generation(&mk).saturating_add(1);
+        let generation = self.current_index_generation(mk).saturating_add(1);
         let index = IndexData {
             generation,
             entries: self.entries.clone(),
         };
         let json = serde_json::to_vec(&index).map_err(|e| format!("序列化索引失败: {e}"))?;
-        let enc = crypto::encrypt(&json, &mk)?;
+        let enc = crypto::encrypt(&json, mk)?;
 
-        // 索引备份：若原索引存在，先备份一份到 index.enc.bak 以供断电/损坏容灾
-        if self.index_path().exists() {
-            let bak_path = self.vault_dir.join("index.enc.bak");
-            let _ = fs::copy(self.index_path(), bak_path);
-        }
-
+        // 备份与主索引写入同一代次的最新密文：否则恢复旧备份时会因代次小于锚点
+        // 被回滚检测拒绝，备份等于不可用。先写备份再写主索引，最后更新锚点。
+        atomic_write(&self.vault_dir.join("index.enc.bak"), &enc)?;
         atomic_write(&self.index_path(), &enc)?;
         // 先落索引、后更新锚点：中途崩溃时索引代次会领先锚点，加载时按索引修复锚点即可。
         store_generation_anchor(&self.current_vault_id, generation);
@@ -1464,9 +1515,7 @@ impl VaultManager {
         self.auto_lock_minutes = mins;
         let mut cfg = load_config(&self.config_path).unwrap_or_default();
         cfg.auto_lock_minutes = Some(mins);
-        if let Ok(bytes) = serde_json::to_vec(&cfg) {
-            let _ = atomic_write(&self.config_path, &bytes);
-        }
+        let _ = save_meta_json(&self.config_path, &cfg);
     }
 
     pub fn reset_vault(&mut self) -> Result<(), String> {
@@ -1480,11 +1529,8 @@ impl VaultManager {
         // 与 delete_vault 一致：清空保险箱后同步移除索引代次锚点，
         // 否则下次新建同名保险箱会因锚点残留而误判「索引回滚」。
         let _ = keychain::delete_index_generation(&self.current_vault_id);
-        if let Some(mut mk) = self.master_key.take() {
-            crypto::zeroize_slice(&mut mk);
-        }
-        self.entries.clear();
         self.master_key = None;
+        self.entries.clear();
         self.is_unlocked = false;
         let _ = create_private_dir(&self.data_dir);
         let _ = create_private_dir(&self.temp_dir);
@@ -1513,8 +1559,7 @@ impl VaultManager {
 }
 
 fn load_config(path: &Path) -> Option<AppConfig> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    load_meta_json(path)
 }
 
 fn default_documents_dir() -> Result<PathBuf, String> {
@@ -1552,7 +1597,7 @@ fn zip_directory_to_file(dir: &Path, dest: &Path) -> Result<(), String> {
         visited: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<(), String> {
         let canon = fs::canonicalize(current)
-            .map_err(|e| format!("规范化目录路径失败 {}: {e}", current.display()))?;
+            .map_err(|e| format!("规范化目录路径失败 {}: {e}", redact_path(current)))?;
         if !visited.insert(canon) {
             return Ok(());
         }
@@ -1689,7 +1734,7 @@ mod tests {
 
         let mut vm = VaultManager {
             entries: Vec::new(),
-            master_key: Some([7u8; 32]),
+            master_key: Some(Zeroizing::new([7u8; 32])),
             is_unlocked: true,
             data_base: temp_dir.clone(),
             current_vault_id: "default".into(),
@@ -1741,7 +1786,7 @@ mod tests {
 
         let mut vm = VaultManager {
             entries: Vec::new(),
-            master_key: Some([7u8; 32]),
+            master_key: Some(Zeroizing::new([7u8; 32])),
             is_unlocked: true,
             data_base: temp_dir.clone(),
             current_vault_id: "default".into(),
@@ -1787,12 +1832,14 @@ mod tests {
 
         fs::write(vm.index_path(), b"corrupted bytes").unwrap();
 
+        // 备份与主索引现在写入同一代次的最新密文，因此恢复出来的是最新状态（2 条），
+        // 而不是上一代（1 条）——否则旧代次备份会被回滚检测拒绝，备份形同虚设。
         let recovered = vm.load_index_with_key(&[7u8; 32]).unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].name, "secret.txt");
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[1].name, "notes.txt");
 
         let loaded_again = vm.load_index_with_key(&[7u8; 32]).unwrap();
-        assert_eq!(loaded_again.len(), 1);
+        assert_eq!(loaded_again.len(), 2);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -1966,7 +2013,7 @@ mod tests {
         };
 
         let recovery_code = vm.set_password("OldPassword123!", false).unwrap();
-        let mk = vm.master_key.unwrap();
+        let mk = **vm.master_key.as_ref().unwrap();
 
         // 伪造一个使用 100,000 次迭代的旧版 keyring（不记录 recovery_iterations）
         let salt = fs::read(vm.salt_path()).unwrap();

@@ -1,8 +1,11 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::Entry;
+use rand::RngCore;
 
 const DEFAULT_SERVICE: &str = "com.filelocker.vault";
 const ACCOUNT: &str = "password";
 const GENERATION_ACCOUNT: &str = "index-generation";
+const METADATA_ACCOUNT: &str = "metadata-key";
 
 fn service_for_vault(vault_id: &str) -> String {
     if vault_id == "default" || vault_id.is_empty() {
@@ -74,4 +77,37 @@ pub fn delete_index_generation(vault_id: &str) -> Result<(), String> {
         let _ = en.delete_password();
     }
     Ok(())
+}
+
+fn metadata_entry() -> Result<Entry, String> {
+    Entry::new(DEFAULT_SERVICE, METADATA_ACCOUNT).map_err(|e| format!("钥匙串访问失败: {e}"))
+}
+
+/// 读取或创建用于加密本地元数据（vaults.json / config.json）的 32 字节密钥。
+///
+/// 首次调用生成随机密钥并以 base64 存入系统钥匙串。钥匙串不可用时返回 `Err`，
+/// 调用方应回退为明文存储，保证应用在无 Secret Service 的环境仍能启动。
+pub fn load_or_create_metadata_key() -> Result<[u8; 32], String> {
+    let en = metadata_entry()?;
+    match en.get_password() {
+        Ok(raw) => {
+            let bytes = STANDARD
+                .decode(raw.trim())
+                .map_err(|e| format!("元数据密钥格式无效: {e}"))?;
+            if bytes.len() != 32 {
+                return Err("元数据密钥长度无效".into());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Ok(key)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            en.set_password(&STANDARD.encode(key))
+                .map_err(|e| format!("保存元数据密钥失败: {e}"))?;
+            Ok(key)
+        }
+        Err(e) => Err(format!("读取元数据密钥失败: {e}")),
+    }
 }

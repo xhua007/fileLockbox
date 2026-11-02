@@ -57,6 +57,29 @@ function el(tag, attrs = {}, children = []) {
   return e;
 }
 
+const CHEVRON_DOWN_SVG = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function getCurrentVaultName(fallback = '默认保险箱') {
+  return state.currentVault ? state.currentVault.name : fallback;
+}
+
+function createVaultPill(opts = {}) {
+  const vaultName = getCurrentVaultName(opts.defaultName || '默认保险箱');
+  const attrs = {
+    class: 'vault-pill' + (opts.class ? ' ' + opts.class : ''),
+    title: opts.title || '切换或管理保险箱',
+    onclick: e => toggleVaultMenu(e)
+  };
+  if (opts.id) attrs.id = opts.id;
+  if (opts.style) attrs.style = opts.style;
+
+  return el('div', attrs, [
+    el('span', { class: 'vault-shield' + (opts.isMain ? ' topbar-shield' : '') }, '🛡️'),
+    el('span', { class: opts.isMain ? 'topbar-title' : 'vault-name' }, vaultName),
+    el('span', { class: 'arrow', html: CHEVRON_DOWN_SVG })
+  ]);
+}
+
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -285,17 +308,11 @@ function renderSetup() {
   rememberCb.checked = false; // 默认不勾选，符合最高安全基线
   let submitting = false;
 
-  const vaultName = state.currentVault ? state.currentVault.name : '默认保险箱';
-  const vaultPill = el('div', {
-    class: 'vault-pill',
+  const vaultName = getCurrentVaultName('默认保险箱');
+  const vaultPill = createVaultPill({
     style: 'margin: 0 auto 16px auto; width: fit-content;',
-    title: '切换保险箱',
-    onclick: e => toggleVaultMenu(e)
-  }, [
-    el('span', {}, '🛡️'),
-    el('span', {}, vaultName),
-    el('span', { class: 'arrow' }, '▾')
-  ]);
+    title: '切换保险箱'
+  });
 
   const submit = async () => {
     if (submitting) return;
@@ -378,17 +395,11 @@ function renderUnlock() {
   let unlocking = false;
   const unlockBtn = el('button', { class: 'btn btn-primary', onclick: () => doUnlock() }, '解锁');
 
-  const vaultName = state.currentVault ? state.currentVault.name : '文件保险箱';
-  const vaultPill = el('div', {
-    class: 'vault-pill',
+  const vaultName = getCurrentVaultName('默认保险箱');
+  const vaultPill = createVaultPill({
     style: 'margin: 0 auto 16px auto; width: fit-content;',
-    title: '切换保险箱',
-    onclick: e => toggleVaultMenu(e)
-  }, [
-    el('span', {}, '🛡️'),
-    el('span', {}, vaultName),
-    el('span', { class: 'arrow' }, '▾')
-  ]);
+    title: '切换保险箱'
+  });
 
   const doUnlock = async () => {
     if (unlocking || state.lockoutRemaining > 0) return;
@@ -619,17 +630,11 @@ function renderMain() {
 
   // Top bar with Vault Switcher Pill
   const topbar = el('div', { class: 'topbar' });
-  const vaultName = state.currentVault ? state.currentVault.name : '默认保险箱';
-  const vaultPill = el('div', {
+  const vaultPill = createVaultPill({
     id: 'vaultPill',
-    class: 'vault-pill',
-    title: '切换或管理保险箱',
-    onclick: e => toggleVaultMenu(e)
-  }, [
-    el('span', { class: 'topbar-shield' }, '🛡️'),
-    el('span', { class: 'topbar-title' }, vaultName),
-    el('span', { class: 'arrow' }, '▾')
-  ]);
+    isMain: true,
+    title: '切换或管理保险箱'
+  });
   const left = el('div', { class: 'topbar-left' }, [vaultPill]);
 
   const searchInput = el('input', {
@@ -668,7 +673,10 @@ function renderMain() {
     class: 'btn-add',
     title: '添加文件或文件夹',
     onclick: e => toggleAddMenu(e)
-  }, '＋ 添加 ▾');
+  }, [
+    el('span', {}, '＋ 添加'),
+    el('span', { class: 'arrow', html: CHEVRON_DOWN_SVG })
+  ]);
   const lockBtnEl = el('button', { class: 'lock-btn', onclick: doLock }, '🔒 锁定');
   const right = el('div', { class: 'topbar-right' }, [countLabel, addBtn, multiBtn, gearBtn, lockBtnEl]);
   topbar.append(left, center, right);
@@ -1195,7 +1203,8 @@ function toggleAddMenu(e) {
   const menu = $('#addMenu');
   if (menu.classList.contains('visible')) { hideAddMenu(); return; }
   hideAllMenus();
-  const btn = e ? (e.currentTarget || e.target) : $('#addBtn');
+  const btn = e ? (e.currentTarget || e.target.closest('#addBtn')) : $('#addBtn');
+  if (btn) btn.classList.add('open');
   const rect = btn.getBoundingClientRect();
   menu.classList.add('visible');
   const menuRect = menu.getBoundingClientRect();
@@ -1209,6 +1218,8 @@ function toggleAddMenu(e) {
 function hideAddMenu() {
   const m = $('#addMenu');
   if (m) m.classList.remove('visible');
+  const ab = $('#addBtn');
+  if (ab) ab.classList.remove('open');
 }
 
 async function chooseAndAdd(directory) {
@@ -1247,6 +1258,7 @@ function toggleVaultMenu(e) {
   }
 
   const btn = e ? (e.currentTarget || e.target.closest('.vault-pill')) : $('#vaultPill');
+  if (btn) btn.classList.add('open');
   const rect = btn.getBoundingClientRect();
   menu.classList.add('visible');
   const menuRect = menu.getBoundingClientRect();
@@ -1260,6 +1272,7 @@ function toggleVaultMenu(e) {
 function hideVaultMenu() {
   const m = $('#vaultMenu');
   if (m) m.classList.remove('visible');
+  document.querySelectorAll('.vault-pill').forEach(p => p.classList.remove('open'));
 }
 
 function showCreateVaultModal() {

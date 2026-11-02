@@ -256,20 +256,52 @@
   .vault-pill {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 5px 10px;
-    border-radius: 7px;
+    gap: 7px;
+    padding: 6px 13px;
+    border-radius: 8px;
     background: var(--bg-secondary);
     border: 1px solid var(--border-light);
     color: var(--text);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all 0.15s ease;
     user-select: none;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
   }
-  .vault-pill:hover { background: var(--hover); border-color: var(--border); }
-  .vault-pill .arrow { font-size: 10px; color: var(--text-secondary); margin-left: 2px; }
+  .vault-pill:hover,
+  .vault-pill.open {
+    background: var(--hover);
+    border-color: var(--border);
+  }
+  .vault-pill .vault-shield {
+    font-size: 16px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+  }
+  .vault-pill .arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    color: var(--text-secondary);
+    margin-left: 2px;
+    transition: transform 0.2s ease, color 0.15s ease;
+  }
+  .vault-pill:hover .arrow,
+  .vault-pill.open .arrow {
+    color: var(--text);
+  }
+  .vault-pill.open .arrow {
+    transform: rotate(180deg);
+  }
+  .vault-pill .arrow svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+  }
 
   .topbar-center { flex: 1; display: flex; justify-content: center; }
   .search-box { width: 100%; max-width: 360px; position: relative; }
@@ -380,7 +412,26 @@
     font-family: inherit;
     transition: all 0.15s;
   }
-  .btn-add:hover { background: var(--hover); }
+  .btn-add:hover,
+  .btn-add.open { background: var(--hover); }
+  .btn-add .arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 12px;
+    height: 12px;
+    color: var(--primary);
+    margin-left: 2px;
+    transition: transform 0.2s ease;
+  }
+  .btn-add.open .arrow {
+    transform: rotate(180deg);
+  }
+  .btn-add .arrow svg {
+    display: block;
+    width: 12px;
+    height: 12px;
+  }
 
   .status-bar {
     display: flex;
