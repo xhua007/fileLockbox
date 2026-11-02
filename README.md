@@ -2,7 +2,7 @@
 
 一款本地优先的加密文件保险箱，支持 macOS 与 Windows。文件在本地使用 AES-256-GCM 加密后保存，不依赖任何云服务。
 
-当前主版本基于 **Tauri 2 + Rust + 原生 HTML/CSS/JS**；仓库同时保留了早期的 **SwiftUI / SwiftPM** 实现（`Sources/FileLocker`），仅支持 macOS 13+。
+本项目基于 **Tauri 2 + Rust + 原生 HTML/CSS/JS** 构建，一套代码在 macOS 与 Windows 上实现 100% 一致的功能体验。
 
 ## 功能特性
 
@@ -44,7 +44,6 @@
 - **桌面框架**：Tauri 2
 - **后端**：Rust（`aes-gcm`、`pbkdf2`、`sha2`、`hmac`、`zip`、`keyring`、`trash`、`directories`、`uuid`）
 - **前端**：单文件 `src/index.html`（原生 HTML/CSS/JS，无构建步骤）
-- **旧版实现**：SwiftUI（仅在 macOS 上通过 SwiftPM 构建，支持 Touch ID）
 
 ## 目录结构
 
@@ -54,20 +53,16 @@
 ├── src/                          # Tauri 前端（单文件页面）
 ├── src-tauri/                    # Rust 后端
 │   ├── src/
-│   │   ├── crypto.rs             # PBKDF2 派生、AES-256-GCM、恢复码
-│   │   ├── vault.rs              # 保险箱核心逻辑（加解密、索引、导入导出）
-│   │   ├── keychain.rs           # 系统钥匙串存取密码
-│   │   ├── fs.rs                 # 废纸篓、打开路径、大小格式化
+│   │   ├── crypto.rs             # PBKDF2 派生、AES-256-GCM、流式分块加解密、恢复码
+│   │   ├── vault.rs              # 保险箱核心逻辑（多保险箱、索引、导入导出、重命名）
+│   │   ├── keychain.rs           # 系统钥匙串 / 凭据管理器存取密码
+│   │   ├── fs.rs                 # 废纸篓/回收站、打开路径、大小格式化
 │   │   ├── models.rs             # 条目 / keyring / 配置数据结构
-│   │   └── lib.rs                # Tauri 命令注册
+│   │   └── lib.rs                # Tauri 命令注册与窗口事件
 │   ├── capabilities/default.json # 窗口权限
 │   └── tauri.conf.json           # 应用与打包配置
 ├── scripts/
-│   ├── build_dmg_tauri.sh        # 构建 macOS 通用版并生成 DMG
-│   ├── build_dmg.sh              # 构建旧版 Swift 应用并生成 DMG
-│   └── make_icon.swift           # 生成应用图标
-├── Sources/FileLocker/           # 旧版 SwiftUI 实现（macOS 13+）
-├── Package.swift
+│   └── build_dmg_tauri.sh        # 构建 macOS 通用版并生成 DMG
 └── package.json
 ```
 
@@ -129,12 +124,6 @@ npm run build
 ```
 
 - 输出产物位于：`build-tauri/FileLocker-macOS-universal.dmg`（含 Applications 替身，可直接双击安装）。
-
-#### 方式 C：构建旧版 SwiftUI 应用（仅限 macOS）
-
-```bash
-./scripts/build_dmg.sh
-```
 
 ## 数据存储位置
 
