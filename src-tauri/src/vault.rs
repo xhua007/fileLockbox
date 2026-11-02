@@ -24,6 +24,45 @@ pub struct VaultManager {
     pub temp_dir: PathBuf,
     pub config_path: PathBuf,
     pub auto_lock_minutes: u64,
+    pub failed_attempts: u32,
+    pub lockout_until: Option<i64>,
+}
+
+/// 安全粉碎文件：用 0 字节覆写数据并执行 sync_all 强制刷盘，最后从文件系统删除，
+/// 防止物理扇区残留明文数据被数据恢复工具或取证工具提取。
+fn secure_shred_file(path: &Path) -> std::io::Result<()> {
+    if let Ok(meta) = fs::metadata(path) {
+        let len = meta.len();
+        if len > 0 {
+            if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
+                use std::io::Write;
+                let chunk_size = 64 * 1024;
+                let zeros = vec![0u8; chunk_size];
+                let mut written = 0u64;
+                while written < len {
+                    let to_write = (chunk_size as u64).min(len - written) as usize;
+                    let _ = f.write_all(&zeros[..to_write]);
+                    written += to_write as u64;
+                }
+                let _ = f.sync_all();
+            }
+        }
+    }
+    fs::remove_file(path)
+}
+
+fn secure_shred_dir_recursive(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                secure_shred_dir_recursive(&p);
+                let _ = fs::remove_dir(&p);
+            } else {
+                let _ = secure_shred_file(&p);
+            }
+        }
+    }
 }
 
 /// 加密索引落盘的 JSON 外层结构（整个 entries 数组一次加密）。
@@ -158,6 +197,8 @@ impl VaultManager {
             temp_dir,
             config_path,
             auto_lock_minutes,
+            failed_attempts: 0,
+            lockout_until: None,
         };
 
         // 启动时主动清理上次异常断电或退出遗留的临时解密明文文件
@@ -244,8 +285,7 @@ impl VaultManager {
         Ok(recovery_code)
     }
 
-    /// 用密码解锁。若不存在 keyring.json 但存在 salt+index，视为旧版本，
-    /// 直接用密码派生密钥解密索引，并自动迁移到 keyring 体系。
+    /// 用密码解锁（包含防暴力破解指数冷却保护）。
     pub fn unlock(
         &mut self,
         password: &str,
@@ -256,25 +296,54 @@ impl VaultManager {
             return Err("保险箱尚未设置密码".into());
         }
 
-        if self.keyring_path().exists() {
-            // 新版双包装 keyring
-            let master_key = self.unwrap_with_password(password)?;
-            self.master_key = Some(master_key);
-            self.entries = self.load_index_with_key(&master_key)?;
-            self.is_unlocked = true;
+        let now = Utc::now().timestamp();
+        if let Some(lockout) = self.lockout_until {
+            if now < lockout {
+                let remaining = lockout - now;
+                return Err(format!("输错密码次数过多，安全保护中，请等待 {remaining} 秒后再试"));
+            } else {
+                self.lockout_until = None;
+            }
+        }
+
+        let unlock_res = if self.keyring_path().exists() {
+            self.unwrap_with_password(password)
         } else {
-            // 旧版：密码派生密钥直接解密索引
             let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
             let master_key = crypto::derive_key_password(password, &salt);
-            self.entries = self.load_index_with_key(&master_key)?;
-            let recovery_code =
-                self.upgrade_to_keyring(&master_key, password).map_err(|e| {
-                    format!("旧保险箱迁移失败（可解锁但无法写入 keyring）: {e}")
-                })?;
-            self.master_key = Some(master_key);
-            self.is_unlocked = true;
-            let _ = recovery_code;
-        }
+            self.load_index_with_key(&master_key).map(|_| master_key)
+        };
+
+        let master_key = match unlock_res {
+            Ok(mk) => {
+                self.failed_attempts = 0;
+                self.lockout_until = None;
+                mk
+            }
+            Err(_) => {
+                self.failed_attempts += 1;
+                let cooldown = match self.failed_attempts {
+                    0..=2 => 0,
+                    3..=4 => 5,
+                    5..=7 => 30,
+                    _ => 60,
+                };
+                if cooldown > 0 {
+                    self.lockout_until = Some(now + cooldown);
+                    return Err(format!(
+                        "密码错误！已连续输错 {} 次，安全保护触发，请等待 {} 秒后再试",
+                        self.failed_attempts, cooldown
+                    ));
+                } else {
+                    let tries_left = 3 - self.failed_attempts;
+                    return Err(format!("密码错误！剩余 {} 次尝试后将触发安全冷却延迟", tries_left));
+                }
+            }
+        };
+
+        self.master_key = Some(master_key);
+        self.entries = self.load_index_with_key(&master_key)?;
+        self.is_unlocked = true;
 
         if remember {
             let _ = keychain::save_password(&self.current_vault_id, password, use_biometry);
@@ -335,6 +404,7 @@ impl VaultManager {
     }
 
     /// 将旧版本保险箱升级为 keyring 体系。返回新生成的恢复码。
+    #[allow(dead_code)]
     fn upgrade_to_keyring(
         &self,
         master_key: &[u8; 32],
@@ -845,8 +915,13 @@ impl VaultManager {
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let entry = self.entries.remove(pos);
             let blob = self.data_dir.join(&entry.cipher_path);
-            let _ = fs::remove_file(blob);
+            let _ = secure_shred_file(&blob);
         }
+    }
+
+    /// 一键清除当前保险箱已保存在系统钥匙串中的密码
+    pub fn forget_saved_password(&mut self) -> Result<(), String> {
+        keychain::delete_password(&self.current_vault_id)
     }
 
     pub fn change_password(&mut self, old: &str, new: &str) -> Result<String, String> {
@@ -961,17 +1036,7 @@ impl VaultManager {
 
     pub fn clear_temp(&self) -> Result<(), String> {
         if self.temp_dir.exists() {
-            for entry in
-                fs::read_dir(&self.temp_dir).map_err(|e| format!("读取临时目录失败: {e}"))?
-            {
-                let Ok(entry) = entry else { continue };
-                let p = entry.path();
-                if p.is_dir() {
-                    let _ = fs::remove_dir_all(p);
-                } else {
-                    let _ = fs::remove_file(p);
-                }
-            }
+            secure_shred_dir_recursive(&self.temp_dir);
         }
         Ok(())
     }
@@ -1210,6 +1275,8 @@ mod tests {
             temp_dir: temp_sub,
             config_path: temp_dir.join("config.json"),
             auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
         };
 
         vm.entries.push(VaultEntry {
@@ -1257,6 +1324,8 @@ mod tests {
             temp_dir: temp_sub,
             config_path: temp_dir.join("config.json"),
             auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
         };
 
         vm.entries.push(VaultEntry {
@@ -1319,6 +1388,8 @@ mod tests {
             temp_dir: temp_sub,
             config_path: temp_dir.join("config.json"),
             auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
         };
 
         // 初始保险箱列表包含默认保险箱
@@ -1357,6 +1428,65 @@ mod tests {
 
         // 仅剩一个保险箱时，尝试删除应该报错保护
         assert!(vm.delete_vault("default").is_err());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_secure_shred_file() {
+        let temp_dir = std::env::temp_dir().join(format!("filelocker_shred_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let target = temp_dir.join("sensitive_secret.txt");
+        fs::write(&target, b"Confidential plain text!").unwrap();
+        assert!(target.exists());
+
+        secure_shred_file(&target).unwrap();
+        assert!(!target.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unlock_rate_limiting() {
+        let temp_dir = std::env::temp_dir().join(format!("filelocker_ratelimit_test_{}", Uuid::new_v4()));
+        let vault_dir = temp_dir.join("vault");
+        let data_dir = vault_dir.join("data");
+        let temp_sub = vault_dir.join("tmp");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&temp_sub).unwrap();
+
+        let mut vm = VaultManager {
+            entries: Vec::new(),
+            master_key: None,
+            is_unlocked: false,
+            data_base: temp_dir.clone(),
+            current_vault_id: "default".into(),
+            current_vault_name: "默认保险箱".into(),
+            vault_dir: vault_dir.clone(),
+            data_dir,
+            temp_dir: temp_sub,
+            config_path: temp_dir.join("config.json"),
+            auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
+        };
+
+        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.lock();
+
+        // 连续输错 3 次
+        assert!(vm.unlock("wrong1", false, false).is_err());
+        assert_eq!(vm.failed_attempts, 1);
+        assert!(vm.unlock("wrong2", false, false).is_err());
+        assert_eq!(vm.failed_attempts, 2);
+        let err3 = vm.unlock("wrong3", false, false).unwrap_err();
+        assert_eq!(vm.failed_attempts, 3);
+        assert!(err3.contains("安全保护触发"));
+        assert!(vm.lockout_until.is_some());
+
+        // 此时即使输入正确密码，也处于安全冷却中，被安全阻断
+        let blocked = vm.unlock("CorrectPassword123!", false, false).unwrap_err();
+        assert!(blocked.contains("安全保护中"));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

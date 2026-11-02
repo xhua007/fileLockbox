@@ -89,11 +89,12 @@
     margin-bottom: 12px;
   }
   .form-input:focus { border-color: var(--primary); background: var(--bg); }
+  .form-input:disabled { opacity: 0.6; cursor: not-allowed; }
   .form-checkbox {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin: 14px 0;
+    margin: 12px 0 4px 0;
     font-size: 13px;
     color: var(--text-secondary);
     cursor: pointer;
@@ -104,6 +105,33 @@
     accent-color: var(--primary);
     cursor: pointer;
   }
+  .form-checkbox-hint {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 14px;
+    line-height: 1.4;
+    text-align: left;
+  }
+  .strength-meter {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border-light);
+    margin: 2px 0 6px 0;
+    overflow: hidden;
+  }
+  .strength-bar {
+    height: 100%;
+    width: 0%;
+    border-radius: 2px;
+    transition: width 0.25s ease, background 0.25s ease;
+  }
+  .strength-text {
+    font-size: 11px;
+    margin-top: -2px;
+    margin-bottom: 10px;
+    text-align: right;
+  }
+
   .btn {
     display: inline-flex;
     align-items: center;
@@ -151,6 +179,7 @@
     margin-bottom: 10px;
     text-align: left;
     min-height: 18px;
+    line-height: 1.4;
   }
   .link-btn {
     background: none;
@@ -464,9 +493,9 @@
   }
   .file-icon.folder { background: rgba(0, 122, 255, 0.12); color: #007AFF; }
   .file-icon.image { background: rgba(175, 82, 222, 0.12); color: #AF52DE; }
+  .file-icon.media { background: rgba(255, 45, 85, 0.12); color: #FF2D55; }
   .file-icon.document { background: rgba(255, 149, 0, 0.12); color: #FF9500; }
   .file-icon.archive { background: rgba(255, 204, 0, 0.15); color: #B28900; }
-  .file-icon.media { background: rgba(255, 45, 85, 0.12); color: #FF2D55; }
   .file-icon.code { background: rgba(52, 199, 89, 0.12); color: #34C759; }
   .file-icon.other { background: rgba(142, 142, 147, 0.12); color: #8E8E93; }
   .file-info { flex: 1; min-width: 0; }
@@ -659,6 +688,8 @@
       <div class="submenu-item" data-val="30">30 分钟</div>
     </div>
   </div>
+  <div class="dropdown-item" data-action="shred-temp">🧹 安全粉碎所有临时预览</div>
+  <div class="dropdown-item" data-action="forget-pw">🔑 忘记已记住的密码</div>
   <div class="menu-sep"></div>
   <div class="dropdown-item danger" data-action="reset">🗑 清空当前保险箱…</div>
 </div>
@@ -708,6 +739,8 @@ const state = {
   recoveryStep: 1,
   recoveryCodeInput: '',
   modalOpen: false,
+  lockoutRemaining: 0,
+  lockoutInterval: null,
 };
 
 // ===== Utility =====
@@ -769,6 +802,72 @@ function showToast(msg, isError = false) {
 }
 function showError(msg) { showToast(msg, true); }
 
+// ===== 密码强度检测 =====
+function checkPasswordStrength(pwd) {
+  if (!pwd) return { score: 0, text: '', level: 'none', valid: false };
+  if (pwd.length < 8) return { score: 1, text: '密码过短（至少 8 位）', level: 'weak', valid: false };
+
+  // 常见弱密码与规律校验
+  const weakPatterns = [
+    /^12345678/i,
+    /^password/i,
+    /^qwerty/i,
+    /^admin/i,
+    /^(\w)\1{7,}$/i, // 全部连续相同字符
+    /^\d+$/ // 纯数字
+  ];
+  for (const pat of weakPatterns) {
+    if (pat.test(pwd)) {
+      return { score: 1, text: '密码过于简单，容易被 AI/字典工具破解', level: 'weak', valid: false };
+    }
+  }
+
+  let score = 0;
+  if (pwd.length >= 8) score += 1;
+  if (pwd.length >= 12) score += 1;
+  if (/[a-z]/.test(pwd)) score += 1;
+  if (/[A-Z]/.test(pwd)) score += 1;
+  if (/[0-9]/.test(pwd)) score += 1;
+  if (/[^a-zA-Z0-9]/.test(pwd)) score += 1;
+
+  if (score <= 3) return { score: 2, text: '密码强度：中等（建议混入大写字母与符号）', level: 'medium', valid: true };
+  return { score: 3, text: '密码强度：高（具备强抗 AI/暴力破解能力）', level: 'strong', valid: true };
+}
+
+function createPasswordInputWithMeter(placeholder) {
+  const input = el('input', { type: 'password', class: 'form-input', placeholder, style: 'margin-bottom:6px;' });
+  const bar = el('div', { class: 'strength-bar' });
+  const meter = el('div', { class: 'strength-meter' }, [bar]);
+  const text = el('div', { class: 'strength-text' });
+
+  input.addEventListener('input', () => {
+    const res = checkPasswordStrength(input.value);
+    if (!input.value) {
+      bar.style.width = '0%';
+      text.textContent = '';
+      return;
+    }
+    if (res.level === 'weak') {
+      bar.style.width = '33%';
+      bar.style.background = 'var(--danger)';
+      text.textContent = res.text;
+      text.style.color = 'var(--danger)';
+    } else if (res.level === 'medium') {
+      bar.style.width = '66%';
+      bar.style.background = '#FF9500';
+      text.textContent = res.text;
+      text.style.color = '#FF9500';
+    } else if (res.level === 'strong') {
+      bar.style.width = '100%';
+      bar.style.background = '#34C759';
+      text.textContent = res.text;
+      text.style.color = '#34C759';
+    }
+  });
+
+  return { input, elements: [input, meter, text] };
+}
+
 // ===== Multi-Vault Info =====
 async function loadVaultsInfo() {
   try {
@@ -790,6 +889,8 @@ async function switchVault(vaultId) {
     state.selectedIds.clear();
     state.multiSelectMode = false;
     state.hasSavedPassword = info.has_saved_password;
+    if (state.lockoutInterval) { clearInterval(state.lockoutInterval); state.lockoutInterval = null; }
+    state.lockoutRemaining = 0;
     await loadVaultsInfo();
 
     if (info.exists) {
@@ -858,9 +959,11 @@ function renderSetup() {
   const container = el('div', { class: 'auth-container' });
   const card = el('div', { class: 'auth-card' });
   const errDiv = el('div', { class: 'error-text' });
-  const pwd1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置密码（至少4位）' });
-  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认密码' });
-  const rememberCb = el('input', { type: 'checkbox', checked: 'checked' });
+  const pwMeter = createPasswordInputWithMeter('设置主密码（至少 8 位）');
+  const pwd1 = pwMeter.input;
+  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认主密码' });
+  const rememberCb = el('input', { type: 'checkbox' });
+  rememberCb.checked = false; // 默认不勾选，符合最高安全基线
   let submitting = false;
 
   const vaultName = state.currentVault ? state.currentVault.name : '默认保险箱';
@@ -880,8 +983,9 @@ function renderSetup() {
     const p1 = pwd1.value, p2 = pwd2.value;
     const rem = rememberCb.checked;
     errDiv.textContent = '';
-    if (p1.length < 4) { errDiv.textContent = '密码至少4位'; return; }
-    if (p1 !== p2) { errDiv.textContent = '两次密码不一致'; return; }
+    const check = checkPasswordStrength(p1);
+    if (!check.valid) { errDiv.textContent = check.text; return; }
+    if (p1 !== p2) { errDiv.textContent = '两次输入的密码不一致'; return; }
     submitting = true;
     btn.disabled = true; btn.textContent = '创建中…';
     try {
@@ -906,14 +1010,42 @@ function renderSetup() {
     vaultPill,
     el('div', { class: 'lock-icon' }, '🔒'),
     el('div', { class: 'auth-title' }, `初始化「${vaultName}」`),
-    el('div', { class: 'auth-desc' }, '密码用于加密您的文件，请妥善保管。\n忘记密码时可使用恢复码重置。'),
-    pwd1, pwd2,
-    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码']),
+    el('div', { class: 'auth-desc' }, '密码用于加密派生主密钥，请设置 8 位以上高强度密码。\n若忘记密码，仅可通过恢复码重置。'),
+    ...pwMeter.elements,
+    pwd2,
+    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住此保险箱密码']),
+    el('div', { class: 'form-checkbox-hint' }, '🛡️ 仅建议在个人私有电脑开启。公用或多人设备建议保持关闭以防钥匙串凭据被访问。'),
     errDiv, btn
   );
   container.appendChild(card);
   setTimeout(() => pwd1.focus(), 50);
   return container;
+}
+
+function startLockoutCountdown(seconds, btn, input, errEl) {
+  if (state.lockoutInterval) clearInterval(state.lockoutInterval);
+  state.lockoutRemaining = seconds;
+  input.disabled = true;
+  btn.disabled = true;
+
+  const update = () => {
+    if (state.lockoutRemaining <= 0) {
+      clearInterval(state.lockoutInterval);
+      state.lockoutInterval = null;
+      input.disabled = false;
+      btn.disabled = false;
+      btn.textContent = '解锁';
+      errEl.textContent = '安全冷却结束，请重新输入密码';
+      input.focus();
+    } else {
+      btn.textContent = `安全锁定中 (${state.lockoutRemaining}s)`;
+      errEl.textContent = `⚠️ 输错次数过多，触发防暴力破解保护，请等待 ${state.lockoutRemaining} 秒后再试`;
+      state.lockoutRemaining--;
+    }
+  };
+
+  update();
+  state.lockoutInterval = setInterval(update, 1000);
 }
 
 function renderUnlock() {
@@ -940,7 +1072,7 @@ function renderUnlock() {
   ]);
 
   const doUnlock = async () => {
-    if (unlocking) return;
+    if (unlocking || state.lockoutRemaining > 0) return;
     const p = pwd.value;
     errDiv.textContent = '';
     if (!p) { errDiv.textContent = '请输入密码'; return; }
@@ -952,12 +1084,21 @@ function renderUnlock() {
       state.entries = entries;
       state.hasSavedPassword = rememberCb.checked;
       if (state.currentVault) state.currentVault.is_unlocked = true;
+      if (state.lockoutInterval) { clearInterval(state.lockoutInterval); state.lockoutInterval = null; }
+      state.lockoutRemaining = 0;
       enterMain();
     } catch (e) {
-      errDiv.textContent = e || '解锁失败';
+      const errStr = String(e || '解锁失败');
+      errDiv.textContent = errStr;
       unlockBtn.disabled = false;
       unlockBtn.textContent = '解锁';
       unlocking = false;
+
+      // 提取剩余冷却秒数，触发倒计时 UI
+      const match = errStr.match(/请等待\s*(\d+)\s*秒/);
+      if (match) {
+        startLockoutCountdown(parseInt(match[1]), unlockBtn, pwd, errDiv);
+      }
     }
   };
 
@@ -967,7 +1108,7 @@ function renderUnlock() {
   }, '⚡️ 使用已记住的密码解锁');
 
   const doBiometricUnlock = async () => {
-    if (unlocking) return;
+    if (unlocking || state.lockoutRemaining > 0) return;
     unlocking = true;
     errDiv.textContent = '';
     bioBtn.disabled = true;
@@ -978,10 +1119,16 @@ function renderUnlock() {
       if (state.currentVault) state.currentVault.is_unlocked = true;
       enterMain();
     } catch (e) {
-      errDiv.textContent = e || '解锁失败，请输入密码';
+      const errStr = String(e || '解锁失败，请输入密码');
+      errDiv.textContent = errStr;
       bioBtn.disabled = false;
       bioBtn.textContent = '⚡️ 使用已记住的密码解锁';
       unlocking = false;
+
+      const match = errStr.match(/请等待\s*(\d+)\s*秒/);
+      if (match) {
+        startLockoutCountdown(parseInt(match[1]), unlockBtn, pwd, errDiv);
+      }
     }
   };
 
@@ -1010,7 +1157,12 @@ function renderUnlock() {
   }
   card.append(el('button', { class: 'link-btn', onclick: goRecovery }, '忘记密码？用恢复码找回'));
   container.appendChild(card);
-  setTimeout(() => pwd.focus(), 50);
+
+  if (state.lockoutRemaining > 0) {
+    startLockoutCountdown(state.lockoutRemaining, unlockBtn, pwd, errDiv);
+  } else {
+    setTimeout(() => pwd.focus(), 50);
+  }
   return container;
 }
 
@@ -1069,13 +1221,15 @@ function renderRecoveryFlow() {
     );
     setTimeout(() => codeInput.focus(), 50);
   } else if (state.recoveryStep === 2) {
-    const p1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置新密码（至少4位）' });
+    const pwMeter = createPasswordInputWithMeter('设置新密码（至少 8 位）');
+    const p1 = pwMeter.input;
     const p2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认新密码' });
     p1.addEventListener('keydown', e => { if (e.key === 'Enter') p2.focus(); });
     const next = async () => {
       errDiv.textContent = '';
-      if (p1.value.length < 4) { errDiv.textContent = '密码至少4位'; return; }
-      if (p1.value !== p2.value) { errDiv.textContent = '两次密码不一致'; return; }
+      const check = checkPasswordStrength(p1.value);
+      if (!check.valid) { errDiv.textContent = check.text; return; }
+      if (p1.value !== p2.value) { errDiv.textContent = '两次输入的密码不一致'; return; }
       try {
         const code = await invoke('recover_password', { recoveryCode: state.recoveryCodeInput, newPassword: p1.value });
         state.pendingRecoveryCode = code;
@@ -1087,8 +1241,8 @@ function renderRecoveryFlow() {
     card.append(
       el('div', { class: 'lock-icon' }, '🔒'),
       el('div', { class: 'auth-title' }, '设置新密码'),
-      el('div', { class: 'auth-desc' }, '第 2 步：设置新的保险箱密码'),
-      steps, p1, p2, errDiv,
+      el('div', { class: 'auth-desc' }, '第 2 步：设置新的 8 位以上高强度密码'),
+      steps, ...pwMeter.elements, p2, errDiv,
       el('button', { class: 'btn btn-primary', onclick: next }, '确认重置')
     );
     setTimeout(() => p1.focus(), 50);
@@ -1496,12 +1650,12 @@ async function restoreEntry(id) {
 }
 
 async function deleteEntry(entry) {
-  showConfirm(`确定要彻底删除「${entry.name}」吗？密文将被永久清除，不可恢复。`, async () => {
+  showConfirm(`确定要安全粉碎删除「${entry.name}」吗？密文将被 0 字节覆写销毁，不可恢复。`, async () => {
     try {
       await invoke('delete_entry', { id: entry.id });
       state.entries = await invoke('list_entries');
       state.selectedIds.delete(entry.id);
-      showToast('已彻底删除');
+      showToast('已彻底粉碎删除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -1510,13 +1664,13 @@ async function deleteEntry(entry) {
 async function deleteSelected() {
   const ids = Array.from(state.selectedIds);
   if (ids.length === 0) return;
-  showConfirm(`确定要彻底删除选中的 ${ids.length} 项吗？密文将被永久清除，不可恢复。`, async () => {
+  showConfirm(`确定要彻底粉碎删除选中的 ${ids.length} 项吗？密文将被 0 字节覆写销毁，不可恢复。`, async () => {
     try {
       await invoke('delete_entries', { ids });
       state.entries = await invoke('list_entries');
       state.selectedIds.clear();
       state.multiSelectMode = false;
-      showToast('已彻底删除');
+      showToast('已彻底粉碎删除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -1615,7 +1769,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
 async function addFilesByPaths(paths) {
   try {
-    showToast(`正在添加 ${paths.length} 个文件…`);
+    showToast(`正在加密存入 ${paths.length} 个文件…`);
     const added = await invoke('add_files', { paths });
     state.entries = await invoke('list_entries');
     showToast(`已加密存入 ${added.length} 项`);
@@ -1688,10 +1842,31 @@ document.addEventListener('click', e => {
     hideGearMenu();
     return;
   }
-  const gItem = e.target.closest('.dropdown-item');
+  const gItem = e.target.closest('#gearMenu .dropdown-item');
   if (gItem) {
     const action = gItem.dataset.action;
     if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
+    else if (action === 'shred-temp') {
+      hideGearMenu();
+      (async () => {
+        try {
+          await invoke('clear_temp');
+          showToast('已安全粉碎所有临时预览文件');
+        } catch (err) { showError('粉碎失败: ' + err); }
+      })();
+    }
+    else if (action === 'forget-pw') {
+      hideGearMenu();
+      showConfirm('确定要从系统钥匙串/凭据管理器中清除已保存的密码吗？\n清除后下次登录需手动输入密码。', async () => {
+        try {
+          await invoke('forget_saved_password');
+          state.hasSavedPassword = false;
+          if (state.currentVault) state.currentVault.has_saved_password = false;
+          showToast('已清除系统凭据库中的密码');
+          render();
+        } catch (err) { showError('清除失败: ' + err); }
+      });
+    }
     else if (action === 'reset') { hideGearMenu(); showResetConfirm(); }
     else if (action === 'autolock') { gItem.classList.toggle('open'); }
     return;
@@ -1751,7 +1926,6 @@ function toggleVaultMenu(e) {
   if (menu.classList.contains('visible')) { hideVaultMenu(); return; }
   hideAllMenus();
 
-  // 动态渲染所有保险箱列表
   const itemsContainer = $('#vaultListItems');
   itemsContainer.innerHTML = '';
   for (const v of state.vaults) {
@@ -1788,9 +1962,11 @@ function hideVaultMenu() {
 function showCreateVaultModal() {
   const errDiv = el('div', { class: 'error-text' });
   const nameInput = el('input', { type: 'text', class: 'form-input', placeholder: '保险箱名称（如：工作机密）' });
-  const pwd1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置独立密码（至少4位）' });
-  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认密码' });
-  const rememberCb = el('input', { type: 'checkbox', checked: 'checked' });
+  const pwMeter = createPasswordInputWithMeter('设置主密码（至少 8 位）');
+  const pwd1 = pwMeter.input;
+  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认主密码' });
+  const rememberCb = el('input', { type: 'checkbox' });
+  rememberCb.checked = false;
 
   const submit = async () => {
     const name = nameInput.value.trim();
@@ -1798,8 +1974,9 @@ function showCreateVaultModal() {
     const rem = rememberCb.checked;
     errDiv.textContent = '';
     if (!name) { errDiv.textContent = '请输入保险箱名称'; return; }
-    if (p1.length < 4) { errDiv.textContent = '密码至少4位'; return; }
-    if (p1 !== p2) { errDiv.textContent = '两次密码不一致'; return; }
+    const check = checkPasswordStrength(p1);
+    if (!check.valid) { errDiv.textContent = check.text; return; }
+    if (p1 !== p2) { errDiv.textContent = '两次输入的密码不一致'; return; }
 
     try {
       const res = await invoke('create_vault', {
@@ -1828,8 +2005,9 @@ function showCreateVaultModal() {
   const modal = el('div', { class: 'modal' }, [
     el('div', { class: 'modal-title' }, '创建新保险箱'),
     el('div', { class: 'modal-desc' }, '每个保险箱拥有独立的数据目录、加密主密钥与密码保护。'),
-    nameInput, pwd1, pwd2,
+    nameInput, ...pwMeter.elements, pwd2,
     el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住此保险箱密码']),
+    el('div', { class: 'form-checkbox-hint' }, '🛡️ 仅建议在个人专用电脑开启。'),
     errDiv,
     el('div', { class: 'modal-actions' }, [
       el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
@@ -1975,15 +2153,17 @@ function showConfirm(message, onConfirm) {
 function showChangePasswordModal() {
   const errDiv = el('div', { class: 'error-text' });
   const oldP = el('input', { type: 'password', class: 'form-input', placeholder: '当前密码' });
-  const newP = el('input', { type: 'password', class: 'form-input', placeholder: '新密码（至少4位）' });
+  const pwMeter = createPasswordInputWithMeter('新主密码（至少 8 位）');
+  const newP = pwMeter.input;
   const newP2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认新密码' });
 
   const submit = async () => {
     errDiv.textContent = '';
     const o = oldP.value, n = newP.value, n2 = newP2.value;
     if (!o) { errDiv.textContent = '请输入当前密码'; return; }
-    if (n.length < 4) { errDiv.textContent = '新密码至少4位'; return; }
-    if (n !== n2) { errDiv.textContent = '两次密码不一致'; return; }
+    const check = checkPasswordStrength(n);
+    if (!check.valid) { errDiv.textContent = check.text; return; }
+    if (n !== n2) { errDiv.textContent = '两次输入的新密码不一致'; return; }
     try {
       const code = await invoke('change_password', { old: o, new: n });
       closeModal();
@@ -1998,9 +2178,9 @@ function showChangePasswordModal() {
   newP2.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
 
   const modal = el('div', { class: 'modal' }, [
-    el('div', { class: 'modal-title' }, '修改密码'),
-    el('div', { class: 'modal-desc' }, '输入当前密码并设置新密码。修改成功后将生成新的恢复码。'),
-    oldP, newP, newP2,
+    el('div', { class: 'modal-title' }, '修改主密码'),
+    el('div', { class: 'modal-desc' }, '密码修改成功后将重新包装加密主密钥，并生成新的安全恢复码。'),
+    oldP, ...pwMeter.elements, newP2,
     errDiv,
     el('div', { class: 'modal-actions' }, [
       el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
@@ -2013,7 +2193,7 @@ function showChangePasswordModal() {
 
 function showResetConfirm() {
   const vaultName = state.currentVault ? state.currentVault.name : '当前保险箱';
-  showConfirm(`确定要清空「${vaultName}」吗？该保险箱内的所有加密文件将被永久删除，此操作不可恢复！`, async () => {
+  showConfirm(`确定要清空「${vaultName}」吗？该保险箱内的所有加密文件将被永久粉碎删除，此操作不可恢复！`, async () => {
     try {
       await invoke('reset_vault');
       state.entries = [];

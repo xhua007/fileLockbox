@@ -176,6 +176,12 @@ fn reset_vault(state: State<VaultState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn forget_saved_password(state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.forget_saved_password()
+}
+
+#[tauri::command]
 fn get_vault_size(state: State<VaultState>) -> Result<u64, String> {
     let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.get_vault_size()
@@ -260,6 +266,7 @@ pub fn run() {
             get_auto_lock_minutes,
             set_auto_lock_minutes,
             reset_vault,
+            forget_saved_password,
             get_vault_size,
             get_current_vault,
             list_vaults,
