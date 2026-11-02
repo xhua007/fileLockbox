@@ -544,6 +544,7 @@ struct VaultView: View {
         case category = "分类"
         case addedAt = "时间"
         case size = "大小"
+        case name = "名称"
 
         var id: String { rawValue }
     }
@@ -553,13 +554,11 @@ struct VaultView: View {
     @State private var searchText = ""
     @FocusState private var isSearchFocused: Bool
     @State private var showChangePassword = false
-    @State private var showSettings = false
-    /// 多选：选中的 entry id（仅在多选模式下使用）
+    @State private var showBatchDeleteConfirm = false
     @State private var selectedIDs = Set<UUID>()
     @State private var multiSelectMode = false
     @State private var idleTimer: Timer?
     @State private var idleMonitor: IdleMonitor?
-    /// 自动锁定：用户设置的空闲分钟数，0 表示关闭
     @AppStorage("autoLockMinutes") private var autoLockMinutes: Int = 0
 
     var body: some View {
@@ -568,11 +567,12 @@ struct VaultView: View {
             if !vault.entries.isEmpty {
                 searchAndSortBar
             }
-            if multiSelectMode && !selectedIDs.isEmpty {
-                selectionBar
-            }
             Divider()
             content
+            if multiSelectMode && !selectedIDs.isEmpty {
+                Divider()
+                selectionBar
+            }
         }
         .onAppear { startIdleMonitor() }
         .onDisappear { stopIdleMonitor() }
@@ -604,6 +604,24 @@ struct VaultView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }
+        .confirmationDialog(
+            "确定要彻底删除选中的 \(selectedIDs.count) 个文件吗？",
+            isPresented: $showBatchDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("彻底删除", role: .destructive) {
+                for id in selectedIDs {
+                    if let e = vault.entries.first(where: { $0.id == id }) {
+                        vault.delete(e)
+                    }
+                }
+                selectedIDs.removeAll()
+                multiSelectMode = false
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("密文将被永久清除，不可恢复。")
+        }
     }
 
     private var header: some View {
@@ -615,6 +633,26 @@ struct VaultView: View {
 
             Text("\(multiSelectMode && !selectedIDs.isEmpty ? "已选 \(selectedIDs.count) / " : "")\(vault.entries.count) 项")
                 .foregroundStyle(.secondary)
+
+            // 添加文件按钮 (+)
+            Menu {
+                Button {
+                    addFilesFromPanel(chooseDirectories: false)
+                } label: {
+                    Label("添加文件…", systemImage: "doc.badge.plus")
+                }
+                Button {
+                    addFilesFromPanel(chooseDirectories: true)
+                } label: {
+                    Label("添加文件夹…", systemImage: "folder.badge.plus")
+                }
+            } label: {
+                Image(systemName: "plus")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("添加文件或文件夹")
 
             if !multiSelectMode {
                 Button {
@@ -715,39 +753,22 @@ struct VaultView: View {
         .padding(.bottom, 10)
     }
 
+    /// 位于下边框虚线底部的批量操作栏
     private var selectionBar: some View {
         HStack(spacing: 10) {
             Button(role: .destructive) {
-                for id in selectedIDs {
-                    if let e = vault.entries.first(where: { $0.id == id }) {
-                        vault.delete(e)
-                    }
-                }
-                selectedIDs.removeAll()
-                multiSelectMode = false
+                showBatchDeleteConfirm = true
             } label: {
                 Label("删除", systemImage: "trash")
             }
+            .buttonStyle(.bordered)
 
             Button {
-                // 批量导出：全部导出到一个选择的目录
-                let panel = NSOpenPanel()
-                panel.canChooseFiles = false
-                panel.canChooseDirectories = true
-                panel.canCreateDirectories = true
-                panel.prompt = "导出到这里"
-                panel.message = "选择导出位置，所有选中文件将被导出到该文件夹。"
-                if panel.runModal() == .OK, let dir = panel.url {
-                    for id in selectedIDs {
-                        guard let e = vault.entries.first(where: { $0.id == id }) else { continue }
-                        vault.export(e, to: dir.appendingPathComponent(e.name))
-                    }
-                    selectedIDs.removeAll()
-                    multiSelectMode = false
-                }
+                batchExport()
             } label: {
                 Label("导出", systemImage: "square.and.arrow.up")
             }
+            .buttonStyle(.bordered)
 
             Spacer()
 
@@ -759,7 +780,37 @@ struct VaultView: View {
             .buttonStyle(.borderless)
         }
         .padding(.horizontal, 20)
-        .padding(.bottom, 8)
+        .padding(.top, 8)
+        .padding(.bottom, 16)
+    }
+
+    private func addFilesFromPanel(chooseDirectories: Bool) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = !chooseDirectories
+        panel.canChooseDirectories = chooseDirectories
+        panel.allowsMultipleSelection = true
+        panel.prompt = "添加"
+        panel.message = chooseDirectories ? "选择要存入保险箱的文件夹" : "选择要存入保险箱的文件"
+        if panel.runModal() == .OK {
+            vault.addItems(urls: panel.urls)
+        }
+    }
+
+    private func batchExport() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "导出到这里"
+        panel.message = "选择导出位置，所有选中文件将被导出到该文件夹。"
+        if panel.runModal() == .OK, let dir = panel.url {
+            for id in selectedIDs {
+                guard let e = vault.entries.first(where: { $0.id == id }) else { continue }
+                vault.export(e, to: dir.appendingPathComponent(e.name))
+            }
+            selectedIDs.removeAll()
+            multiSelectMode = false
+        }
     }
 
     private func resetIdleTimer() {
@@ -778,7 +829,6 @@ struct VaultView: View {
         }, onIdle: { [weak vault] in
             DispatchQueue.main.async { vault?.lock() }
         })
-        // 把超时时间告诉 monitor（通过通知或直接设置）：这里用事件回调自己 reset 即可。
         resetIdleTimer()
     }
 
@@ -806,6 +856,8 @@ struct VaultView: View {
                 return lhs.addedAt < rhs.addedAt
             case .size:
                 return lhs.size < rhs.size
+            case .name:
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             }
         }
         return ascending ? items : Array(items.reversed())
@@ -822,7 +874,7 @@ struct VaultView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.bottom, 14)
+        .padding(.bottom, multiSelectMode && !selectedIDs.isEmpty ? 0 : 14)
     }
 
     private var noResultsState: some View {
@@ -843,13 +895,6 @@ struct VaultView: View {
                     EntryRow(entry: entry, showCheckbox: multiSelectMode, selectedIDs: $selectedIDs)
                         .background(Color(nsColor: .controlBackgroundColor))
                         .contentShape(Rectangle())
-                        .contextMenu {
-                            Button { vault.open(entry) } label: { Label("打开", systemImage: "eye") }
-                            Button { vault.export(entry) } label: { Label("导出…", systemImage: "square.and.arrow.up") }
-                            Button { vault.restore(entry) } label: { Label("还原到原位置", systemImage: "arrow.uturn.backward") }
-                            Divider()
-                            Button(role: .destructive) { vault.delete(entry) } label: { Label("删除", systemImage: "trash") }
-                        }
                     Divider().padding(.leading, 40)
                 }
             }
@@ -868,7 +913,7 @@ struct VaultView: View {
             Text("将文件或文件夹拖拽到这里")
                 .font(.title3.weight(.medium))
 
-            Text("文件会被加密后保存在本机，原文件移入废纸篓。")
+            Text("文件会被加密后保存在本机。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -896,6 +941,28 @@ enum FileCategory: Int, CaseIterable {
         case .archive: return "压缩包"
         case .media: return "音视频"
         case .other: return "其他"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .folder: return "folder.fill"
+        case .image: return "photo.fill"
+        case .document: return "doc.text.fill"
+        case .archive: return "archivebox.fill"
+        case .media: return "film.fill"
+        case .other: return "doc.fill"
+        }
+    }
+
+    var iconColor: Color {
+        switch self {
+        case .folder: return .blue
+        case .image: return .purple
+        case .document: return .orange
+        case .archive: return .yellow
+        case .media: return .pink
+        case .other: return .secondary
         }
     }
 
@@ -939,78 +1006,120 @@ struct EntryRow: View {
     }
 
     private var isSelected: Bool { selectedIDs.contains(entry.id) }
+    private var category: FileCategory { FileCategory(entry: entry) }
 
     var body: some View {
         HStack(spacing: 12) {
             if showCheckbox {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isSelected ? .blue : .secondary)
-                    .font(.title3)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .font(.system(size: 16))
+                    .contentShape(Rectangle())
                     .onTapGesture {
-                        if isSelected { selectedIDs.remove(entry.id) }
-                        else { selectedIDs.insert(entry.id) }
+                        withAnimation(.easeInOut(duration: 0.12)) {
+                            if isSelected { selectedIDs.remove(entry.id) }
+                            else { selectedIDs.insert(entry.id) }
+                        }
                     }
             }
 
-            Image(systemName: entry.kind == .folder ? "folder.fill" : "doc.fill")
-                .font(.title3)
-                .foregroundStyle(entry.kind == .folder ? .blue : .gray)
+            // Apple 风格精美色彩图标块
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(category.iconColor.opacity(0.12))
+                    .frame(width: 30, height: 30)
+                Image(systemName: category.iconName)
+                    .font(.system(size: 15))
+                    .foregroundStyle(category.iconColor)
+            }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.name)
+                    .font(.system(size: 13, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                Text("\(FileCategory(entry: entry).title) · \(formattedSize) · \(formattedDate)")
-                    .font(.caption)
+                Text("\(category.title) · \(formattedSize) · \(formattedDate)")
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            HStack(spacing: 10) {
-                rowButton("还原到原位置", systemImage: "arrow.uturn.backward", tint: .blue) {
+            // 悬停操作按钮
+            HStack(spacing: 4) {
+                rowActionBtn("还原到原位置", systemImage: "arrow.uturn.backward") {
                     vault.restore(entry)
                 }
-                rowButton("打开", systemImage: "eye") { vault.open(entry) }
-                rowButton("导出", systemImage: "square.and.arrow.up") { vault.export(entry) }
-                rowButton("删除", systemImage: "trash", tint: .red) { showDeleteConfirm = true }
+                rowActionBtn("打开", systemImage: "eye") {
+                    vault.open(entry)
+                }
+                rowActionBtn("导出…", systemImage: "square.and.arrow.up") {
+                    vault.export(entry)
+                }
+                rowActionBtn("彻底删除", systemImage: "trash", tint: .red) {
+                    showDeleteConfirm = true
+                }
             }
-            .opacity(hovering ? 1 : 0.65)
+            .opacity(hovering ? 1 : 0)
+            .animation(.easeInOut(duration: 0.15), value: hovering)
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: 8)
                 .fill(
-                    isSelected ? Color.blue.opacity(0.15)
-                    : hovering ? Color.primary.opacity(0.06)
+                    isSelected ? Color.accentColor.opacity(0.12)
+                    : hovering ? Color(nsColor: .quaternaryLabelColor)
                     : Color.clear
                 )
         )
-        .padding(.horizontal, 4)
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        .onTapGesture(count: 2) {
+            vault.open(entry)
+        }
+        .onTapGesture(count: 1) {
+            if showCheckbox {
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    if isSelected { selectedIDs.remove(entry.id) }
+                    else { selectedIDs.insert(entry.id) }
+                }
+            }
+        }
         .onDrag {
             guard let url = vault.temporaryExportURL(for: entry) else { return NSItemProvider() }
             return NSItemProvider(contentsOf: url) ?? NSItemProvider()
         }
-        .help("可直接拖到 Finder 或其他位置导出")
-        .alert("确定删除「\(entry.name)」？", isPresented: $showDeleteConfirm) {
+        .contextMenu {
+            Button { vault.open(entry) } label: { Label("打开", systemImage: "eye") }
+            Button { vault.export(entry) } label: { Label("导出…", systemImage: "square.and.arrow.up") }
+            Button { vault.restore(entry) } label: { Label("还原到原位置", systemImage: "arrow.uturn.backward") }
+            Divider()
+            Button(role: .destructive) { showDeleteConfirm = true } label: { Label("彻底删除", systemImage: "trash") }
+        }
+        .alert("确定彻底删除「\(entry.name)」？", isPresented: $showDeleteConfirm) {
             Button("取消", role: .cancel) {}
-            Button("移入废纸篓", role: .destructive) { vault.delete(entry) }
+            Button("彻底删除", role: .destructive) { vault.delete(entry) }
         } message: {
-            Text("该文件会从保险箱中移出，并放入废纸篓，可随时从废纸篓恢复。")
+            Text("密文将被永久清除，不可恢复。")
         }
     }
 
-    private func rowButton(_ title: String, systemImage: String, tint: Color = .secondary, action: @escaping () -> Void) -> some View {
+    private func rowActionBtn(_ title: String, systemImage: String, tint: Color = .secondary, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .labelStyle(.iconOnly)
+            Image(systemName: systemImage)
+                .font(.system(size: 11))
+                .foregroundStyle(tint)
+                .frame(width: 24, height: 24)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.9), in: RoundedRectangle(cornerRadius: 5))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 0.5)
+                )
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.plain)
         .help(title)
-        .foregroundStyle(tint)
     }
 
     private var formattedSize: String {

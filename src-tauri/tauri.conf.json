@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "FileLocker",
   "version": "1.0.0",
-  "identifier": "com.example.filelocker",
+  "identifier": "com.filelocker.FileLocker",
   "build": {
     "frontendDist": "../src",
     "devUrl": null,
@@ -51,11 +51,6 @@
     }
   },
   "plugins": {
-    "dialog": {},
-    "fs": {
-      "scope": ["**"]
-    },
-    "os": {},
     "shell": {
       "open": true
     }

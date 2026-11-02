@@ -5,9 +5,9 @@ pub mod models;
 pub mod vault;
 
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
 
-use crate::models::VaultEntry;
+use crate::models::{CreateVaultResult, VaultEntry, VaultInfo};
 use crate::vault::VaultManager;
 
 type VaultState = Mutex<VaultManager>;
@@ -68,6 +68,16 @@ fn biometric_unlock(state: State<VaultState>) -> Result<Vec<VaultEntry>, String>
 fn list_entries(state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
     let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.list_entries()
+}
+
+#[tauri::command]
+fn rename_entry(
+    id: String,
+    new_name: String,
+    state: State<VaultState>,
+) -> Result<VaultEntry, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.rename_entry(&id, &new_name)
 }
 
 #[tauri::command]
@@ -171,6 +181,53 @@ fn get_vault_size(state: State<VaultState>) -> Result<u64, String> {
     v.get_vault_size()
 }
 
+// 多保险箱命令
+#[tauri::command]
+fn get_current_vault(state: State<VaultState>) -> Result<VaultInfo, String> {
+    let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    Ok(v.get_current_vault_info())
+}
+
+#[tauri::command]
+fn list_vaults(state: State<VaultState>) -> Result<Vec<VaultInfo>, String> {
+    let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.list_vaults()
+}
+
+#[tauri::command]
+fn switch_vault(vault_id: String, state: State<VaultState>) -> Result<VaultInfo, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.switch_vault(&vault_id)
+}
+
+#[tauri::command]
+fn create_vault(
+    name: String,
+    password: String,
+    remember: bool,
+    use_biometry: bool,
+    state: State<VaultState>,
+) -> Result<CreateVaultResult, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.create_vault(&name, &password, remember, use_biometry)
+}
+
+#[tauri::command]
+fn rename_vault(
+    vault_id: String,
+    new_name: String,
+    state: State<VaultState>,
+) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.rename_vault(&vault_id, &new_name)
+}
+
+#[tauri::command]
+fn delete_vault(vault_id: String, state: State<VaultState>) -> Result<VaultInfo, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.delete_vault(&vault_id)
+}
+
 /// Tauri 应用构建入口。main.rs 通过 `filelocker_lib::run()` 调用。
 pub fn run() {
     tauri::Builder::default()
@@ -188,6 +245,7 @@ pub fn run() {
             has_saved_password,
             biometric_unlock,
             list_entries,
+            rename_entry,
             add_files,
             open_entry,
             export_entry,
@@ -203,7 +261,22 @@ pub fn run() {
             set_auto_lock_minutes,
             reset_vault,
             get_vault_size,
+            get_current_vault,
+            list_vaults,
+            switch_vault,
+            create_vault,
+            rename_vault,
+            delete_vault,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<Mutex<VaultManager>>() {
+                    if let Ok(mut v) = state.lock() {
+                        v.lock();
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

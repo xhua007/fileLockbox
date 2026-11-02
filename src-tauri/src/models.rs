@@ -24,6 +24,8 @@ pub struct Keyring {
     pub password_wrap: Vec<u8>,
     pub recovery_salt: Vec<u8>,
     pub recovery_wrap: Vec<u8>,
+    #[serde(default)]
+    pub iterations: Option<u32>,
 }
 
 /// 索引加密落盘格式：nonce + ciphertext。
@@ -34,9 +36,36 @@ pub struct EncryptedIndexBlob {
     pub ciphertext: Vec<u8>,
 }
 
-/// 本地应用配置（auto-lock 时长等）。
+/// 本地应用配置（auto-lock 时长、当前激活保险箱等）。
 #[derive(Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub auto_lock_minutes: Option<u64>,
+    #[serde(default)]
+    pub current_vault_id: Option<String>,
+}
+
+/// 保险箱概况
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VaultProfile {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+/// 保险箱状态与元信息
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VaultInfo {
+    pub id: String,
+    pub name: String,
+    pub exists: bool,
+    pub is_unlocked: bool,
+    pub has_saved_password: bool,
+}
+
+/// 创建新保险箱结果（包含恢复码）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CreateVaultResult {
+    pub vault: VaultInfo,
+    pub recovery_code: String,
 }

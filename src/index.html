@@ -221,7 +221,27 @@
   .topbar > * { -webkit-app-region: no-drag; }
   .topbar-left { display: flex; align-items: center; gap: 8px; min-width: 180px; }
   .topbar-title { font-size: 15px; font-weight: 600; }
-  .topbar-shield { font-size: 20px; }
+  .topbar-shield { font-size: 18px; }
+
+  /* Vault Switcher Pill */
+  .vault-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: 7px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-light);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .vault-pill:hover { background: var(--hover); border-color: var(--border); }
+  .vault-pill .arrow { font-size: 10px; color: var(--text-secondary); margin-left: 2px; }
+
   .topbar-center { flex: 1; display: flex; justify-content: center; }
   .search-box { width: 100%; max-width: 360px; position: relative; }
   .search-input {
@@ -292,31 +312,65 @@
   .sort-label { color: var(--text-secondary); margin-right: 4px; }
   .seg-group {
     display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
+    background: rgba(118, 118, 128, 0.12);
+    border-radius: 7px;
+    padding: 2px;
+    border: none;
   }
   .seg-btn {
-    padding: 4px 12px;
-    background: var(--bg);
+    padding: 3px 12px;
+    background: transparent;
     border: none;
-    border-right: 1px solid var(--border);
+    border-radius: 5px;
     color: var(--text-secondary);
     font-size: 12px;
     cursor: pointer;
     font-family: inherit;
     transition: all 0.15s;
   }
-  .seg-btn:last-child { border-right: none; }
-  .seg-btn.active { background: var(--bg-secondary); color: var(--text); font-weight: 500; }
-  .seg-btn:hover:not(.active) { background: var(--hover); }
+  .seg-btn.active {
+    background: var(--bg);
+    color: var(--text);
+    font-weight: 500;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  }
+  .seg-btn:hover:not(.active) { color: var(--text); }
+
+  .btn-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border-light);
+    background: var(--bg);
+    color: var(--primary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+  }
+  .btn-add:hover { background: var(--hover); }
+
+  .status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 5px 16px;
+    border-top: 1px solid var(--border-light);
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+  }
 
   .action-bar {
     display: flex;
     align-items: center;
     padding: 8px 16px;
     background: var(--selected);
-    border-bottom: 1px solid var(--border-light);
+    border-top: 1px solid var(--border-light);
     gap: 8px;
     font-size: 13px;
   }
@@ -399,13 +453,22 @@
     color: #fff;
   }
   .file-icon {
-    font-size: 28px;
+    font-size: 16px;
     flex-shrink: 0;
-    width: 36px;
-    text-align: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
-  .file-icon.folder { color: var(--primary); }
-  .file-icon.file { color: var(--text-secondary); }
+  .file-icon.folder { background: rgba(0, 122, 255, 0.12); color: #007AFF; }
+  .file-icon.image { background: rgba(175, 82, 222, 0.12); color: #AF52DE; }
+  .file-icon.document { background: rgba(255, 149, 0, 0.12); color: #FF9500; }
+  .file-icon.archive { background: rgba(255, 204, 0, 0.15); color: #B28900; }
+  .file-icon.media { background: rgba(255, 45, 85, 0.12); color: #FF2D55; }
+  .file-icon.code { background: rgba(52, 199, 89, 0.12); color: #34C759; }
+  .file-icon.other { background: rgba(142, 142, 147, 0.12); color: #8E8E93; }
   .file-info { flex: 1; min-width: 0; }
   .file-name {
     font-weight: 500;
@@ -438,19 +501,6 @@
   }
   .file-action-btn:hover { background: var(--border-light); color: var(--text); }
   .file-action-btn.danger:hover { color: var(--danger); }
-
-  .footer-error {
-    padding: 8px 16px;
-    background: #FFF3F3;
-    color: var(--danger);
-    font-size: 13px;
-    border-top: 1px solid #FFD7D7;
-    display: none;
-  }
-  @media (prefers-color-scheme: dark) {
-    .footer-error { background: #3A1C1C; border-top-color: #5A2A2A; }
-  }
-  .footer-error.visible { display: block; }
 
   .toast-container {
     position: fixed;
@@ -490,7 +540,7 @@
     border-radius: 12px;
     padding: 24px;
     width: 90%;
-    max-width: 400px;
+    max-width: 420px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.3);
   }
   .modal-title { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
@@ -537,12 +587,14 @@
     margin: 4px 0;
   }
   .dropdown-item { justify-content: space-between; }
-  .dropdown-submenu-indicator { color: var(--text-secondary); font-size: 11px; }
+  .dropdown-submenu-indicator { color: var(--text-secondary); font-size: 10px; margin-left: 8px; }
   .dropdown-item.has-submenu { position: relative; }
   .submenu {
     position: absolute;
-    left: 100%;
-    top: 0;
+    right: 100%;
+    left: auto;
+    top: -4px;
+    margin-right: 4px;
     background: var(--bg);
     border: 1px solid var(--border-light);
     border-radius: 8px;
@@ -551,8 +603,25 @@
     box-shadow: 0 8px 24px rgba(0,0,0,0.15);
     display: none;
   }
-  .dropdown-item.has-submenu:hover .submenu { display: block; }
+  .dropdown-item.has-submenu:hover .submenu,
+  .dropdown-item.has-submenu.open .submenu { display: block; }
+  .submenu-item {
+    padding: 7px 14px;
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .submenu-item:hover { background: var(--hover); }
   .submenu-item.active { color: var(--primary); font-weight: 500; }
+  .submenu-item.active::after {
+    content: '✓';
+    color: var(--primary);
+    font-weight: 600;
+    margin-left: 8px;
+  }
 
   .steps { display: flex; justify-content: center; gap: 8px; margin-bottom: 20px; }
   .step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
@@ -569,6 +638,7 @@
 
 <div class="context-menu" id="contextMenu">
   <div class="context-menu-item" data-action="open">👁 打开</div>
+  <div class="context-menu-item" data-action="rename">✏️ 重命名…</div>
   <div class="context-menu-item" data-action="export">⤴ 导出</div>
   <div class="context-menu-item" data-action="restore">↩ 还原到原位置</div>
   <div class="context-menu-sep"></div>
@@ -579,7 +649,7 @@
   <div class="dropdown-item" data-action="changepw">🔒 修改密码…</div>
   <div class="dropdown-item has-submenu" data-action="autolock">
     <span>⏱ 自动锁定</span>
-    <span class="dropdown-submenu-indicator">▶</span>
+    <span class="dropdown-submenu-indicator">◀</span>
     <div class="submenu" id="autoLockSubmenu">
       <div class="submenu-item" data-val="0">关闭</div>
       <div class="submenu-item" data-val="1">1 分钟</div>
@@ -590,7 +660,21 @@
     </div>
   </div>
   <div class="menu-sep"></div>
-  <div class="dropdown-item danger" data-action="reset">🗑 清空保险箱…</div>
+  <div class="dropdown-item danger" data-action="reset">🗑 清空当前保险箱…</div>
+</div>
+
+<div class="dropdown-menu" id="addMenu">
+  <div class="dropdown-item" data-action="add-files">📄 添加文件…</div>
+  <div class="dropdown-item" data-action="add-folders">📁 添加文件夹…</div>
+</div>
+
+<!-- 保险箱切换菜单 -->
+<div class="dropdown-menu" id="vaultMenu" style="min-width: 220px;">
+  <div id="vaultListItems"></div>
+  <div class="menu-sep"></div>
+  <div class="dropdown-item" data-action="create-vault">＋ 新建保险箱…</div>
+  <div class="dropdown-item" data-action="rename-vault">✏️ 重命名当前保险箱…</div>
+  <div class="dropdown-item danger" data-action="delete-vault">🗑 删除当前保险箱…</div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
@@ -606,6 +690,8 @@ const listen = TAURI.event.listen;
 // ===== State =====
 const state = {
   screen: 'loading',
+  currentVault: null,
+  vaults: [],
   entries: [],
   filteredEntries: [],
   selectedIds: new Set(),
@@ -683,6 +769,51 @@ function showToast(msg, isError = false) {
 }
 function showError(msg) { showToast(msg, true); }
 
+// ===== Multi-Vault Info =====
+async function loadVaultsInfo() {
+  try {
+    state.vaults = await invoke('list_vaults');
+    state.currentVault = await invoke('get_current_vault');
+    state.hasSavedPassword = state.currentVault ? state.currentVault.has_saved_password : false;
+  } catch (e) {
+    console.error('加载保险箱信息失败:', e);
+  }
+}
+
+async function switchVault(vaultId) {
+  hideAllMenus();
+  if (state.currentVault && state.currentVault.id === vaultId) return;
+  try {
+    const info = await invoke('switch_vault', { vaultId });
+    state.currentVault = info;
+    state.entries = [];
+    state.selectedIds.clear();
+    state.multiSelectMode = false;
+    state.hasSavedPassword = info.has_saved_password;
+    await loadVaultsInfo();
+
+    if (info.exists) {
+      if (info.has_saved_password) {
+        try {
+          const entries = await invoke('biometric_unlock');
+          state.entries = entries;
+          if (state.currentVault) state.currentVault.is_unlocked = true;
+          showToast(`已切换至「${info.name}」并自动解锁`);
+          enterMain();
+          return;
+        } catch {}
+      }
+      state.screen = 'unlock';
+    } else {
+      state.screen = 'setup';
+    }
+    showToast(`已切换至「${info.name}」`);
+    render();
+  } catch (e) {
+    showError('切换失败: ' + e);
+  }
+}
+
 // ===== Idle Auto-Lock =====
 function resetIdleTimer() { state.lastActivity = Date.now(); }
 function startIdleMonitor() {
@@ -732,6 +863,18 @@ function renderSetup() {
   const rememberCb = el('input', { type: 'checkbox', checked: 'checked' });
   let submitting = false;
 
+  const vaultName = state.currentVault ? state.currentVault.name : '默认保险箱';
+  const vaultPill = el('div', {
+    class: 'vault-pill',
+    style: 'margin: 0 auto 16px auto; width: fit-content;',
+    title: '切换保险箱',
+    onclick: e => toggleVaultMenu(e)
+  }, [
+    el('span', {}, '🛡️'),
+    el('span', {}, vaultName),
+    el('span', { class: 'arrow' }, '▾')
+  ]);
+
   const submit = async () => {
     if (submitting) return;
     const p1 = pwd1.value, p2 = pwd2.value;
@@ -745,6 +888,8 @@ function renderSetup() {
       const code = await invoke('setup_password', { password: p1, remember: rem, useBiometry: rem });
       state.pendingRecoveryCode = code;
       state.entries = [];
+      state.hasSavedPassword = rem;
+      await loadVaultsInfo();
       state.screen = 'recovery-code';
       render();
     } catch (e) {
@@ -758,11 +903,12 @@ function renderSetup() {
   const btn = el('button', { class: 'btn btn-primary', onclick: submit }, '创建并解锁');
 
   card.append(
+    vaultPill,
     el('div', { class: 'lock-icon' }, '🔒'),
-    el('div', { class: 'auth-title' }, '设置保险箱密码'),
+    el('div', { class: 'auth-title' }, `初始化「${vaultName}」`),
     el('div', { class: 'auth-desc' }, '密码用于加密您的文件，请妥善保管。\n忘记密码时可使用恢复码重置。'),
     pwd1, pwd2,
-    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码并启用 Touch ID']),
+    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码']),
     errDiv, btn
   );
   container.appendChild(card);
@@ -776,25 +922,69 @@ function renderUnlock() {
   const errDiv = el('div', { class: 'error-text' });
   const pwd = el('input', { type: 'password', class: 'form-input', placeholder: '输入密码' });
   const rememberCb = el('input', { type: 'checkbox' });
+  rememberCb.checked = !!state.hasSavedPassword;
+
+  let unlocking = false;
+  const unlockBtn = el('button', { class: 'btn btn-primary', onclick: () => doUnlock() }, '解锁');
+
+  const vaultName = state.currentVault ? state.currentVault.name : '文件保险箱';
+  const vaultPill = el('div', {
+    class: 'vault-pill',
+    style: 'margin: 0 auto 16px auto; width: fit-content;',
+    title: '切换保险箱',
+    onclick: e => toggleVaultMenu(e)
+  }, [
+    el('span', {}, '🛡️'),
+    el('span', {}, vaultName),
+    el('span', { class: 'arrow' }, '▾')
+  ]);
 
   const doUnlock = async () => {
+    if (unlocking) return;
     const p = pwd.value;
     errDiv.textContent = '';
     if (!p) { errDiv.textContent = '请输入密码'; return; }
+    unlocking = true;
+    unlockBtn.disabled = true;
+    unlockBtn.textContent = '正在解锁…';
     try {
       const entries = await invoke('unlock', { password: p, remember: rememberCb.checked, useBiometry: false });
       state.entries = entries;
+      state.hasSavedPassword = rememberCb.checked;
+      if (state.currentVault) state.currentVault.is_unlocked = true;
       enterMain();
-    } catch (e) { errDiv.textContent = e || '解锁失败'; }
+    } catch (e) {
+      errDiv.textContent = e || '解锁失败';
+      unlockBtn.disabled = false;
+      unlockBtn.textContent = '解锁';
+      unlocking = false;
+    }
   };
+
+  const bioBtn = el('button', {
+    class: 'btn bio-btn',
+    onclick: () => doBiometricUnlock()
+  }, '⚡️ 使用已记住的密码解锁');
+
   const doBiometricUnlock = async () => {
+    if (unlocking) return;
+    unlocking = true;
     errDiv.textContent = '';
+    bioBtn.disabled = true;
+    bioBtn.textContent = '正在解锁…';
     try {
       const entries = await invoke('biometric_unlock');
       state.entries = entries;
+      if (state.currentVault) state.currentVault.is_unlocked = true;
       enterMain();
-    } catch (e) { errDiv.textContent = e || '生物识别解锁失败'; }
+    } catch (e) {
+      errDiv.textContent = e || '解锁失败，请输入密码';
+      bioBtn.disabled = false;
+      bioBtn.textContent = '⚡️ 使用已记住的密码解锁';
+      unlocking = false;
+    }
   };
+
   const goRecovery = () => {
     state.recoveryStep = 1;
     state.recoveryCodeInput = '';
@@ -804,17 +994,18 @@ function renderUnlock() {
   pwd.addEventListener('keydown', e => { if (e.key === 'Enter') doUnlock(); });
 
   card.append(
+    vaultPill,
     el('div', { class: 'lock-icon' }, '🔓'),
-    el('div', { class: 'auth-title' }, '输入密码解锁'),
+    el('div', { class: 'auth-title' }, `解锁「${vaultName}」`),
     pwd,
     el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住密码']),
     errDiv,
-    el('button', { class: 'btn btn-primary', onclick: doUnlock }, '解锁')
+    unlockBtn
   );
   if (state.hasSavedPassword) {
     card.append(
       el('div', { class: 'auth-divider' }, el('span', {}, '或')),
-      el('button', { class: 'btn bio-btn', onclick: doBiometricUnlock }, '👆 使用 Touch ID 解锁')
+      bioBtn
     );
   }
   card.append(el('button', { class: 'link-btn', onclick: goRecovery }, '忘记密码？用恢复码找回'));
@@ -953,12 +1144,21 @@ function renderMain() {
   const totalCount = state.entries.length;
   const selectedCount = state.selectedIds.size;
 
-  // Top bar
+  // Top bar with Vault Switcher Pill
   const topbar = el('div', { class: 'topbar' });
-  const left = el('div', { class: 'topbar-left' }, [
+  const vaultName = state.currentVault ? state.currentVault.name : '默认保险箱';
+  const vaultPill = el('div', {
+    id: 'vaultPill',
+    class: 'vault-pill',
+    title: '切换或管理保险箱',
+    onclick: e => toggleVaultMenu(e)
+  }, [
     el('span', { class: 'topbar-shield' }, '🛡️'),
-    el('span', { class: 'topbar-title' }, '文件保险箱')
+    el('span', { class: 'topbar-title' }, vaultName),
+    el('span', { class: 'arrow' }, '▾')
   ]);
+  const left = el('div', { class: 'topbar-left' }, [vaultPill]);
+
   const searchInput = el('input', {
     type: 'text', class: 'search-input',
     placeholder: '搜索文件…', value: state.searchQuery
@@ -986,11 +1186,18 @@ function renderMain() {
     }
   }, '☑️');
   const gearBtn = el('button', {
+    id: 'gearBtn',
     class: 'icon-btn', title: '设置',
     onclick: e => toggleGearMenu(e)
   }, '⚙️');
+  const addBtn = el('button', {
+    id: 'addBtn',
+    class: 'btn-add',
+    title: '添加文件或文件夹',
+    onclick: e => toggleAddMenu(e)
+  }, '＋ 添加 ▾');
   const lockBtnEl = el('button', { class: 'lock-btn', onclick: doLock }, '🔒 锁定');
-  const right = el('div', { class: 'topbar-right' }, [countLabel, multiBtn, gearBtn, lockBtnEl]);
+  const right = el('div', { class: 'topbar-right' }, [countLabel, addBtn, multiBtn, gearBtn, lockBtnEl]);
   topbar.append(left, center, right);
 
   // Sort bar (only when there are files)
@@ -1032,7 +1239,12 @@ function renderMain() {
   );
 
   const listContainer = el('div', { class: 'list-container', id: 'listContainer' });
-  wrapper.append(topbar, sortBar, actionBar, listContainer);
+  let totalBytes = 0;
+  for (const e of state.entries) totalBytes += (e.size || 0);
+  const statusBar = el('div', { class: 'status-bar' }, [
+    el('span', {}, `${totalCount} 个项目 · 已用 ${formatSize(totalBytes)}`)
+  ]);
+  wrapper.append(topbar, sortBar, listContainer, actionBar, statusBar);
 
   updateCountLabel();
   setTimeout(() => renderListInto(listContainer), 0);
@@ -1050,7 +1262,14 @@ function updateCountLabel() {
 function applyFilterAndSort() {
   let list = state.entries.slice();
   const q = state.searchQuery.trim().toLowerCase();
-  if (q) list = list.filter(e => e.name.toLowerCase().includes(q));
+  if (q) {
+    list = list.filter(e => {
+      if (e.name.toLowerCase().includes(q)) return true;
+      if (getCategory(e.name).toLowerCase().includes(q)) return true;
+      if (e.original_path && e.original_path.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  }
   list.sort((a, b) => {
     let cmp = 0;
     if (state.sortBy === 'category') {
@@ -1070,10 +1289,21 @@ function renderListInto(container) {
   container.innerHTML = '';
   applyFilterAndSort();
   if (state.entries.length === 0) {
+    const chooseFileBtn = el('button', {
+      class: 'btn btn-primary',
+      style: 'width:auto;',
+      onclick: () => chooseAndAdd(false)
+    }, '📄 选择文件存入');
+    const chooseFolderBtn = el('button', {
+      class: 'btn btn-outline',
+      style: 'width:auto;',
+      onclick: () => chooseAndAdd(true)
+    }, '📁 选择文件夹存入');
     container.appendChild(el('div', { class: 'empty-state' }, [
       el('div', { class: 'empty-icon' }, '🛡️'),
       el('div', { class: 'empty-text' }, '拖拽文件或文件夹到此处加密存入'),
-      el('div', { class: 'empty-sub' }, '文件将被 AES-256-GCM 加密，仅可通过密码访问')
+      el('div', { class: 'empty-sub' }, '文件将被 AES-256-GCM 流式分块加密，仅可通过密码访问'),
+      el('div', { style: 'display:flex;gap:10px;margin-top:16px;' }, [chooseFileBtn, chooseFolderBtn])
     ]));
     return;
   }
@@ -1093,6 +1323,15 @@ function renderFileItem(entry) {
   const isFolder = entry.kind === 'folder';
   const isSelected = state.selectedIds.has(entry.id);
   const category = getCategory(entry.name);
+  let iconClass = 'other';
+  let iconChar = '📄';
+  if (isFolder) { iconClass = 'folder'; iconChar = '📁'; }
+  else if (category === '图片') { iconClass = 'image'; iconChar = '🖼️'; }
+  else if (category === '视频' || category === '音频') { iconClass = 'media'; iconChar = '🎬'; }
+  else if (category === '文档') { iconClass = 'document'; iconChar = '📄'; }
+  else if (category === '压缩包') { iconClass = 'archive'; iconChar = '📦'; }
+  else if (category === '代码') { iconClass = 'code'; iconChar = '💻'; }
+
   const row = el('div', {
     class: 'file-item' + (isSelected ? ' selected' : ''),
     'data-id': entry.id,
@@ -1104,7 +1343,7 @@ function renderFileItem(entry) {
       onclick: e => { e.stopPropagation(); toggleSelect(entry.id); }
     }, isSelected ? '✓' : ''));
   }
-  row.appendChild(el('div', { class: 'file-icon ' + (isFolder ? 'folder' : 'file') }, isFolder ? '📁' : '📄'));
+  row.appendChild(el('div', { class: 'file-icon ' + iconClass }, iconChar));
   const meta = `${category} · ${formatSize(entry.size)} · ${formatDate(entry.added_at)}`;
   row.appendChild(el('div', { class: 'file-info' }, [
     el('div', { class: 'file-name', title: entry.name }, entry.name),
@@ -1115,6 +1354,7 @@ function renderFileItem(entry) {
     class: 'file-action-btn' + (danger ? ' danger' : ''),
     title, onclick: e => { e.stopPropagation(); handler(); }
   }, emoji));
+  mkBtn('✏️', '重命名', () => showRenameModal(entry));
   mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
   mkBtn('👁', '打开', () => openEntry(entry.id));
   mkBtn('⤴', '导出', () => exportEntry(entry));
@@ -1123,8 +1363,18 @@ function renderFileItem(entry) {
 
   row.addEventListener('click', e => {
     if (e.target.closest('.file-actions') || e.target.closest('.file-checkbox')) return;
-    if (state.multiSelectMode) toggleSelect(entry.id);
-    else openEntry(entry.id);
+    if (state.multiSelectMode) {
+      toggleSelect(entry.id);
+    } else {
+      state.selectedIds.clear();
+      state.selectedIds.add(entry.id);
+      $$('.file-item').forEach(el => el.classList.toggle('selected', el.dataset.id === entry.id));
+      updateCountLabel();
+    }
+  });
+  row.addEventListener('dblclick', e => {
+    if (e.target.closest('.file-actions') || e.target.closest('.file-checkbox')) return;
+    openEntry(entry.id);
   });
   row.addEventListener('contextmenu', e => {
     e.preventDefault();
@@ -1148,6 +1398,58 @@ function toggleSelect(id) {
 }
 
 // ---- File ops ----
+function showRenameModal(entry) {
+  const errDiv = el('div', { class: 'error-text' });
+  const nameInput = el('input', {
+    type: 'text',
+    class: 'form-input',
+    value: entry.name,
+    placeholder: '输入新名称'
+  });
+
+  const submit = async () => {
+    const newName = nameInput.value.trim();
+    errDiv.textContent = '';
+    if (!newName) { errDiv.textContent = '条目名称不能为空'; return; }
+    if (newName === entry.name) { closeModal(); return; }
+    try {
+      const updated = await invoke('rename_entry', { id: entry.id, newName });
+      const idx = state.entries.findIndex(e => e.id === entry.id);
+      if (idx !== -1) state.entries[idx] = updated;
+      closeModal();
+      showToast('重命名成功');
+      render();
+    } catch (e) {
+      errDiv.textContent = e || '重命名失败';
+    }
+  };
+
+  nameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') submit();
+  });
+
+  const modal = el('div', { class: 'modal' }, [
+    el('div', { class: 'modal-title' }, '重命名条目'),
+    el('div', { class: 'modal-desc' }, `为「${entry.name}」输入新的文件或文件夹名称。`),
+    nameInput,
+    errDiv,
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
+      el('button', { class: 'btn btn-primary', style: 'width:auto;padding:8px 20px;', onclick: submit }, '确定')
+    ])
+  ]);
+  showModal(modal);
+  setTimeout(() => {
+    nameInput.focus();
+    const dotIdx = entry.name.lastIndexOf('.');
+    if (dotIdx > 0 && entry.kind !== 'folder') {
+      nameInput.setSelectionRange(0, dotIdx);
+    } else {
+      nameInput.select();
+    }
+  }, 50);
+}
+
 async function openEntry(id) {
   try { await invoke('open_entry', { id }); }
   catch (e) { showError('打开失败: ' + e); }
@@ -1194,12 +1496,12 @@ async function restoreEntry(id) {
 }
 
 async function deleteEntry(entry) {
-  showConfirm(`确定要删除「${entry.name}」吗？文件将被移入废纸篓。`, async () => {
+  showConfirm(`确定要彻底删除「${entry.name}」吗？密文将被永久清除，不可恢复。`, async () => {
     try {
       await invoke('delete_entry', { id: entry.id });
       state.entries = await invoke('list_entries');
       state.selectedIds.delete(entry.id);
-      showToast('已删除');
+      showToast('已彻底删除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -1208,13 +1510,13 @@ async function deleteEntry(entry) {
 async function deleteSelected() {
   const ids = Array.from(state.selectedIds);
   if (ids.length === 0) return;
-  showConfirm(`确定要删除选中的 ${ids.length} 项吗？`, async () => {
+  showConfirm(`确定要彻底删除选中的 ${ids.length} 项吗？密文将被永久清除，不可恢复。`, async () => {
     try {
       await invoke('delete_entries', { ids });
       state.entries = await invoke('list_entries');
       state.selectedIds.clear();
       state.multiSelectMode = false;
-      showToast('已删除');
+      showToast('已彻底删除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -1226,6 +1528,7 @@ async function doLock() {
   state.selectedIds.clear();
   state.multiSelectMode = false;
   state.searchQuery = '';
+  if (state.currentVault) state.currentVault.is_unlocked = false;
   state.screen = 'unlock';
   render();
 }
@@ -1268,16 +1571,19 @@ function setupDragDrop() {
 async function initDragDropListener() {
   try {
     await listen('tauri://drag-drop', async event => {
-      const urls = (event.payload && event.payload.urls) || [];
-      if (urls.length === 0) {
-        // fallback: try dataTransfer files
-        return;
+      let raw = [];
+      if (Array.isArray(event.payload)) {
+        raw = event.payload;
+      } else if (event.payload && Array.isArray(event.payload.paths)) {
+        raw = event.payload.paths;
+      } else if (event.payload && Array.isArray(event.payload.urls)) {
+        raw = event.payload.urls;
       }
-      const paths = urls.map(u => {
+      if (raw.length === 0) return;
+      const paths = raw.map(u => {
         let p = u;
-        if (p.startsWith('file://')) {
+        if (typeof p === 'string' && p.startsWith('file://')) {
           p = decodeURIComponent(p.slice(7));
-          // On Windows file:///C:/...
           if (p.startsWith('/') && /^[A-Za-z]:/.test(p.slice(1))) p = p.slice(1);
         }
         return p;
@@ -1287,11 +1593,9 @@ async function initDragDropListener() {
   } catch {}
 }
 
-// Also listen for native HTML5 drop on document as fallback
 window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('drop', async e => {
     if (state.screen !== 'main') return;
-    // Only process if tauri event didn't catch it, check dataTransfer
     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const paths = [];
       for (let i = 0; i < e.dataTransfer.files.length; i++) {
@@ -1314,7 +1618,7 @@ async function addFilesByPaths(paths) {
     showToast(`正在添加 ${paths.length} 个文件…`);
     const added = await invoke('add_files', { paths });
     state.entries = await invoke('list_entries');
-    showToast(`已添加 ${added.length} 个文件`);
+    showToast(`已加密存入 ${added.length} 项`);
     render();
   } catch (e) { showError('添加失败: ' + e); }
 }
@@ -1324,7 +1628,7 @@ function showContextMenu(x, y) {
   const menu = $('#contextMenu');
   menu.classList.add('visible');
   const maxX = window.innerWidth - 200;
-  const maxY = window.innerHeight - 220;
+  const maxY = window.innerHeight - 250;
   menu.style.left = Math.min(x, maxX) + 'px';
   menu.style.top = Math.min(y, maxY) + 'px';
 }
@@ -1334,6 +1638,8 @@ function hideAllMenus() {
   hideContextMenu();
   const gm = $('#gearMenu');
   if (gm) gm.classList.remove('visible');
+  hideAddMenu();
+  hideVaultMenu();
 }
 
 document.addEventListener('click', e => {
@@ -1346,6 +1652,7 @@ document.addEventListener('click', e => {
     const entry = state.entries.find(x => x.id === id);
     if (!entry) return;
     if (action === 'open') openEntry(id);
+    else if (action === 'rename') showRenameModal(entry);
     else if (action === 'export') exportEntry(entry);
     else if (action === 'restore') restoreEntry(id);
     else if (action === 'delete') deleteEntry(entry);
@@ -1353,13 +1660,27 @@ document.addEventListener('click', e => {
   }
   if (!e.target.closest('#contextMenu')) hideContextMenu();
 
-  const gItem = e.target.closest('.dropdown-item');
-  if (gItem) {
-    const action = gItem.dataset.action;
-    if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
-    else if (action === 'reset') { hideGearMenu(); showResetConfirm(); }
+  const aItem = e.target.closest('#addMenu .dropdown-item');
+  if (aItem) {
+    const act = aItem.dataset.action;
+    hideAddMenu();
+    if (act === 'add-files') chooseAndAdd(false);
+    else if (act === 'add-folders') chooseAndAdd(true);
     return;
   }
+  if (!e.target.closest('#addMenu') && !e.target.closest('#addBtn')) hideAddMenu();
+
+  const vItem = e.target.closest('#vaultMenu .dropdown-item');
+  if (vItem) {
+    const act = vItem.dataset.action;
+    hideVaultMenu();
+    if (act === 'create-vault') showCreateVaultModal();
+    else if (act === 'rename-vault') showRenameVaultModal();
+    else if (act === 'delete-vault') showDeleteVaultConfirm();
+    return;
+  }
+  if (!e.target.closest('#vaultMenu') && !e.target.closest('.vault-pill')) hideVaultMenu();
+
   const sub = e.target.closest('.submenu-item');
   if (sub) {
     const val = parseInt(sub.dataset.val);
@@ -1367,23 +1688,247 @@ document.addEventListener('click', e => {
     hideGearMenu();
     return;
   }
-  if (!e.target.closest('#gearMenu')) hideGearMenu();
+  const gItem = e.target.closest('.dropdown-item');
+  if (gItem) {
+    const action = gItem.dataset.action;
+    if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
+    else if (action === 'reset') { hideGearMenu(); showResetConfirm(); }
+    else if (action === 'autolock') { gItem.classList.toggle('open'); }
+    return;
+  }
+  if (!e.target.closest('#gearMenu') && !e.target.closest('#gearBtn')) hideGearMenu();
 });
+
+// ---- Add menu ----
+function toggleAddMenu(e) {
+  if (e) {
+    e.stopPropagation();
+    e.preventDefault();
+  }
+  const menu = $('#addMenu');
+  if (menu.classList.contains('visible')) { hideAddMenu(); return; }
+  hideAllMenus();
+  const btn = e ? (e.currentTarget || e.target) : $('#addBtn');
+  const rect = btn.getBoundingClientRect();
+  menu.classList.add('visible');
+  const menuRect = menu.getBoundingClientRect();
+  let x = rect.left;
+  let y = rect.bottom + 6;
+  if (x + menuRect.width > window.innerWidth) x = rect.right - menuRect.width;
+  if (y + menuRect.height > window.innerHeight) y = rect.top - menuRect.height - 6;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+function hideAddMenu() {
+  const m = $('#addMenu');
+  if (m) m.classList.remove('visible');
+}
+
+async function chooseAndAdd(directory) {
+  hideAddMenu();
+  try {
+    if (TAURI.dialog && TAURI.dialog.open) {
+      const selected = await TAURI.dialog.open({
+        multiple: true,
+        directory: !!directory,
+        title: directory ? '选择存入保险箱的文件夹' : '选择存入保险箱的文件'
+      }).catch(() => null);
+      if (selected) {
+        const paths = Array.isArray(selected) ? selected : [selected];
+        if (paths.length > 0) await addFilesByPaths(paths);
+      }
+    }
+  } catch (err) { showError('添加失败: ' + err); }
+}
+
+// ---- Vault Switcher menu ----
+function toggleVaultMenu(e) {
+  if (e) {
+    e.stopPropagation();
+    e.preventDefault();
+  }
+  const menu = $('#vaultMenu');
+  if (menu.classList.contains('visible')) { hideVaultMenu(); return; }
+  hideAllMenus();
+
+  // 动态渲染所有保险箱列表
+  const itemsContainer = $('#vaultListItems');
+  itemsContainer.innerHTML = '';
+  for (const v of state.vaults) {
+    const isCurrent = state.currentVault && state.currentVault.id === v.id;
+    const it = el('div', {
+      class: 'dropdown-item' + (isCurrent ? ' active' : ''),
+      onclick: () => switchVault(v.id)
+    }, [
+      el('span', { style: 'display:flex;align-items:center;gap:6px;' }, [
+        el('span', { style: isCurrent ? 'color:var(--primary);font-weight:600;' : 'opacity:0;' }, '✓'),
+        el('span', { style: isCurrent ? 'font-weight:600;' : '' }, v.name)
+      ]),
+      el('span', { style: 'font-size:11px;color:var(--text-secondary);' }, v.id === 'default' ? '默认' : '')
+    ]);
+    itemsContainer.appendChild(it);
+  }
+
+  const btn = e ? (e.currentTarget || e.target.closest('.vault-pill')) : $('#vaultPill');
+  const rect = btn.getBoundingClientRect();
+  menu.classList.add('visible');
+  const menuRect = menu.getBoundingClientRect();
+  let x = rect.left;
+  let y = rect.bottom + 6;
+  if (x + menuRect.width > window.innerWidth) x = rect.right - menuRect.width;
+  if (y + menuRect.height > window.innerHeight) y = rect.top - menuRect.height - 6;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+function hideVaultMenu() {
+  const m = $('#vaultMenu');
+  if (m) m.classList.remove('visible');
+}
+
+function showCreateVaultModal() {
+  const errDiv = el('div', { class: 'error-text' });
+  const nameInput = el('input', { type: 'text', class: 'form-input', placeholder: '保险箱名称（如：工作机密）' });
+  const pwd1 = el('input', { type: 'password', class: 'form-input', placeholder: '设置独立密码（至少4位）' });
+  const pwd2 = el('input', { type: 'password', class: 'form-input', placeholder: '确认密码' });
+  const rememberCb = el('input', { type: 'checkbox', checked: 'checked' });
+
+  const submit = async () => {
+    const name = nameInput.value.trim();
+    const p1 = pwd1.value, p2 = pwd2.value;
+    const rem = rememberCb.checked;
+    errDiv.textContent = '';
+    if (!name) { errDiv.textContent = '请输入保险箱名称'; return; }
+    if (p1.length < 4) { errDiv.textContent = '密码至少4位'; return; }
+    if (p1 !== p2) { errDiv.textContent = '两次密码不一致'; return; }
+
+    try {
+      const res = await invoke('create_vault', {
+        name,
+        password: p1,
+        remember: rem,
+        useBiometry: rem
+      });
+      state.currentVault = res.vault;
+      state.pendingRecoveryCode = res.recovery_code;
+      state.entries = [];
+      state.hasSavedPassword = rem;
+      await loadVaultsInfo();
+      closeModal();
+      state.screen = 'recovery-code';
+      render();
+    } catch (e) {
+      errDiv.textContent = e || '创建保险箱失败';
+    }
+  };
+
+  nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') pwd1.focus(); });
+  pwd1.addEventListener('keydown', e => { if (e.key === 'Enter') pwd2.focus(); });
+  pwd2.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+
+  const modal = el('div', { class: 'modal' }, [
+    el('div', { class: 'modal-title' }, '创建新保险箱'),
+    el('div', { class: 'modal-desc' }, '每个保险箱拥有独立的数据目录、加密主密钥与密码保护。'),
+    nameInput, pwd1, pwd2,
+    el('label', { class: 'form-checkbox' }, [rememberCb, ' 记住此保险箱密码']),
+    errDiv,
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
+      el('button', { class: 'btn btn-primary', style: 'width:auto;padding:8px 20px;', onclick: submit }, '创建并切换')
+    ])
+  ]);
+  showModal(modal);
+  setTimeout(() => nameInput.focus(), 50);
+}
+
+function showRenameVaultModal() {
+  if (!state.currentVault) return;
+  const errDiv = el('div', { class: 'error-text' });
+  const nameInput = el('input', {
+    type: 'text',
+    class: 'form-input',
+    value: state.currentVault.name,
+    placeholder: '新保险箱名称'
+  });
+
+  const submit = async () => {
+    const newName = nameInput.value.trim();
+    errDiv.textContent = '';
+    if (!newName) { errDiv.textContent = '名称不能为空'; return; }
+    if (newName === state.currentVault.name) { closeModal(); return; }
+    try {
+      await invoke('rename_vault', { vaultId: state.currentVault.id, newName });
+      state.currentVault.name = newName;
+      await loadVaultsInfo();
+      closeModal();
+      showToast('保险箱已重命名');
+      render();
+    } catch (e) {
+      errDiv.textContent = e || '重命名失败';
+    }
+  };
+
+  nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+
+  const modal = el('div', { class: 'modal' }, [
+    el('div', { class: 'modal-title' }, '重命名当前保险箱'),
+    el('div', { class: 'modal-desc' }, `为当前保险箱「${state.currentVault.name}」修改显示名称。`),
+    nameInput,
+    errDiv,
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn btn-ghost', onclick: closeModal }, '取消'),
+      el('button', { class: 'btn btn-primary', style: 'width:auto;padding:8px 20px;', onclick: submit }, '确定')
+    ])
+  ]);
+  showModal(modal);
+  setTimeout(() => { nameInput.focus(); nameInput.select(); }, 50);
+}
+
+function showDeleteVaultConfirm() {
+  if (!state.currentVault) return;
+  if (state.vaults.length <= 1) {
+    showError('至少需要保留一个保险箱，无法删除');
+    return;
+  }
+  showConfirm(`确定要彻底删除保险箱「${state.currentVault.name}」吗？\n该保险箱下的所有加密文件及密码将被永久清除，且无法恢复！`, async () => {
+    try {
+      const nextVault = await invoke('delete_vault', { vaultId: state.currentVault.id });
+      state.currentVault = nextVault;
+      state.entries = [];
+      state.selectedIds.clear();
+      state.multiSelectMode = false;
+      await loadVaultsInfo();
+      showToast('保险箱已删除，已自动切换');
+      if (nextVault.exists) {
+        state.screen = 'unlock';
+      } else {
+        state.screen = 'setup';
+      }
+      render();
+    } catch (e) {
+      showError('删除失败: ' + e);
+    }
+  });
+}
 
 // ---- Gear menu ----
 function toggleGearMenu(e) {
+  if (e) {
+    e.stopPropagation();
+    e.preventDefault();
+  }
   const menu = $('#gearMenu');
   if (menu.classList.contains('visible')) { hideGearMenu(); return; }
-  const rect = e.currentTarget.getBoundingClientRect();
+  const btn = e ? (e.currentTarget || e.target) : $('#gearBtn');
+  const rect = btn.getBoundingClientRect();
   menu.classList.add('visible');
-  // Mark active
   $$('#autoLockSubmenu .submenu-item').forEach(it => {
     it.classList.toggle('active', parseInt(it.dataset.val) === state.autoLockMinutes);
   });
   const menuRect = menu.getBoundingClientRect();
   let x = rect.right - menuRect.width;
-  let y = rect.bottom + 4;
-  if (y + menuRect.height > window.innerHeight) y = rect.top - menuRect.height - 4;
+  let y = rect.bottom + 6;
+  if (x < 10) x = 10;
+  if (y + menuRect.height > window.innerHeight) y = rect.top - menuRect.height - 6;
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
 }
@@ -1443,11 +1988,7 @@ function showChangePasswordModal() {
       const code = await invoke('change_password', { old: o, new: n });
       closeModal();
       state.pendingRecoveryCode = code;
-      // show recovery code screen (in-modal style by switching screen)
-      const prevScreen = state.screen;
       state.screen = 'recovery-code';
-      // Override: after save, go back to main
-      const origPending = state.pendingRecoveryCode;
       render();
     } catch (e) { errDiv.textContent = e || '修改失败'; }
   };
@@ -1471,11 +2012,13 @@ function showChangePasswordModal() {
 }
 
 function showResetConfirm() {
-  showConfirm('确定要清空保险箱吗？所有加密文件将被永久删除，此操作不可恢复！', async () => {
+  const vaultName = state.currentVault ? state.currentVault.name : '当前保险箱';
+  showConfirm(`确定要清空「${vaultName}」吗？该保险箱内的所有加密文件将被永久删除，此操作不可恢复！`, async () => {
     try {
       await invoke('reset_vault');
       state.entries = [];
       state.hasSavedPassword = false;
+      await loadVaultsInfo();
       state.screen = 'setup';
       render();
       showToast('保险箱已清空');
@@ -1487,9 +2030,24 @@ function showResetConfirm() {
 async function init() {
   render();
   try {
+    await loadVaultsInfo();
     const exists = await invoke('vault_exists');
     if (exists) {
       state.hasSavedPassword = await invoke('has_saved_password');
+      if (state.hasSavedPassword) {
+        try {
+          const entries = await invoke('biometric_unlock');
+          state.entries = entries;
+          if (state.currentVault) state.currentVault.is_unlocked = true;
+          state.autoLockMinutes = await invoke('get_auto_lock_minutes');
+          enterMain();
+          startIdleMonitor();
+          initDragDropListener();
+          return;
+        } catch (e) {
+          console.warn('记住密码自动解锁失败，展示手动解锁界面:', e);
+        }
+      }
       state.screen = 'unlock';
     } else {
       state.screen = 'setup';
@@ -1503,7 +2061,7 @@ async function init() {
   initDragDropListener();
 }
 
-// Keyboard shortcut: Escape closes menus/modals
+// Keyboard shortcuts
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     hideAllMenus();
@@ -1513,6 +2071,53 @@ document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'l' && state.screen === 'main') {
     e.preventDefault();
     doLock();
+  }
+  // Cmd/Ctrl+F to search
+  if ((e.metaKey || e.ctrlKey) && e.key === 'f' && state.screen === 'main') {
+    e.preventDefault();
+    const s = $('.search-input');
+    if (s) { s.focus(); s.select(); }
+  }
+  // Cmd/Ctrl+A to select all (only when not editing an input)
+  if ((e.metaKey || e.ctrlKey) && e.key === 'a' && state.screen === 'main') {
+    if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+    e.preventDefault();
+    state.multiSelectMode = true;
+    state.filteredEntries.forEach(item => state.selectedIds.add(item.id));
+    render();
+  }
+  // F2 to rename selected file
+  if (e.key === 'F2' && state.screen === 'main') {
+    if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+    if (state.selectedIds.size === 1 && !state.modalOpen) {
+      e.preventDefault();
+      const id = Array.from(state.selectedIds)[0];
+      const entry = state.entries.find(x => x.id === id);
+      if (entry) showRenameModal(entry);
+    }
+  }
+  // Space to preview/open selected file (macOS Quick Look shortcut)
+  if (e.key === ' ' && state.screen === 'main') {
+    if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+    if (state.selectedIds.size === 1) {
+      e.preventDefault();
+      const id = Array.from(state.selectedIds)[0];
+      openEntry(id);
+    }
+  }
+  // Delete / Backspace to delete selected
+  if ((e.key === 'Delete' || e.key === 'Backspace') && state.screen === 'main') {
+    if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+    if (state.selectedIds.size > 0 && !state.modalOpen) {
+      e.preventDefault();
+      if (state.selectedIds.size === 1) {
+        const id = Array.from(state.selectedIds)[0];
+        const entry = state.entries.find(x => x.id === id);
+        if (entry) deleteEntry(entry);
+      } else {
+        deleteSelected();
+      }
+    }
   }
 });
 
