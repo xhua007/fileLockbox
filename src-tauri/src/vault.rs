@@ -5,6 +5,8 @@ use crate::models::{AppConfig, CreateVaultResult, Keyring, VaultEntry, VaultInfo
 use chrono::Utc;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,61 @@ pub struct VaultManager {
     pub auto_lock_minutes: u64,
     pub failed_attempts: u32,
     pub lockout_until: Option<i64>,
+    pub recovery_failed_attempts: u32,
+    pub recovery_lockout_until: Option<i64>,
+    /// 最近一次有效操作的时间戳（秒）。存放在 Cell 中以便 `&self` 方法也能刷新，
+    /// 由 Rust 侧后台线程据此执行权威的空闲自动锁定。
+    pub last_activity: Cell<i64>,
+}
+
+/// 防爆破状态：落盘保存，重启应用后仍然生效，避免「关掉再开」重置失败计数。
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct GuardState {
+    #[serde(default)]
+    failed_attempts: u32,
+    #[serde(default)]
+    lockout_until: Option<i64>,
+    #[serde(default)]
+    recovery_failed_attempts: u32,
+    #[serde(default)]
+    recovery_lockout_until: Option<i64>,
+}
+
+/// security.json：按保险箱 id 隔离的防爆破状态集合。
+#[derive(Serialize, Deserialize, Default)]
+struct GuardFile {
+    #[serde(default)]
+    vaults: BTreeMap<String, GuardState>,
+}
+
+pub fn app_data_dir() -> PathBuf {
+    ProjectDirs::from("com", "filelocker", "FileLocker")
+        .expect("无法定位应用数据目录")
+        .data_dir()
+        .to_path_buf()
+}
+
+/// 密码强度策略（与前端展示规则保持一致，但由 Rust 侧强制执行，
+/// 防止绕过前端直接调用命令设置弱密码）。
+fn validate_password_strength(password: &str) -> Result<(), String> {
+    if password.chars().count() < 8 {
+        return Err("密码至少需要 8 位".into());
+    }
+    let lower = password.to_lowercase();
+    for weak in ["12345678", "password", "qwerty", "admin"] {
+        if lower.starts_with(weak) {
+            return Err("密码过于简单，容易被字典工具破解".into());
+        }
+    }
+    if let Some(first) = password.chars().next() {
+        if password.chars().all(|c| c == first) {
+            return Err("密码过于简单（全部为相同字符）".into());
+        }
+    }
+    if password.chars().all(|c| c.is_ascii_digit()) {
+        return Err("密码不能为纯数字".into());
+    }
+    Ok(())
 }
 
 /// 安全粉碎文件：用 0 字节覆写数据并执行 sync_all 强制刷盘，最后从文件系统删除，
@@ -65,13 +122,50 @@ fn secure_shred_dir_recursive(dir: &Path) {
     }
 }
 
+/// 创建应用私有目录，并在 Unix 上收紧为 0700（仅当前用户可进入/读写）。
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// 以 0600 权限预创建目标文件，随后的写入/解密不会改变该权限，
+/// 避免临时明文在创建瞬间落入同机其他用户可读的宽权限文件。
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// 删除临时明文：文件覆写后删除，目录递归清理。
+fn remove_plain_path(path: &Path) {
+    if path.is_dir() {
+        secure_shred_dir_recursive(path);
+        let _ = fs::remove_dir(path);
+    } else if path.exists() {
+        let _ = secure_shred_file(path);
+    }
+}
+
 /// 加密索引落盘的 JSON 外层结构（整个 entries 数组一次加密）。
 #[derive(Serialize, Deserialize)]
 struct IndexData {
     entries: Vec<VaultEntry>,
 }
 
-const KEYRING_VERSION: u32 = 2;
+const KEYRING_VERSION: u32 = 3;
 const DEFAULT_AUTO_LOCK_MINUTES: u64 = 5;
 
 /// 原子写入文件：写入同目录下的临时文件并执行 sync_all 刷盘，再原子重命名替换目标。
@@ -149,9 +243,7 @@ fn vault_dir_for(data_base: &Path, id: &str) -> PathBuf {
 
 impl VaultManager {
     pub fn new() -> Self {
-        let proj = ProjectDirs::from("com", "filelocker", "FileLocker")
-            .expect("无法定位应用数据目录");
-        let data_base = proj.data_dir().to_path_buf();
+        let data_base = app_data_dir();
         let config_path = data_base.join("config.json");
 
         let app_config = load_config(&config_path);
@@ -182,8 +274,8 @@ impl VaultManager {
         let data_dir = vault_dir.join("data");
         let temp_dir = vault_dir.join("tmp");
 
-        let _ = fs::create_dir_all(&data_dir);
-        let _ = fs::create_dir_all(&temp_dir);
+        let _ = create_private_dir(&data_dir);
+        let _ = create_private_dir(&temp_dir);
 
         let vm = VaultManager {
             entries: Vec::new(),
@@ -199,6 +291,9 @@ impl VaultManager {
             auto_lock_minutes,
             failed_attempts: 0,
             lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
         };
 
         // 启动时主动清理上次异常断电或退出遗留的临时解密明文文件
@@ -221,10 +316,86 @@ impl VaultManager {
         self.salt_path().exists() && self.index_path().exists()
     }
 
+    fn guard_path(&self) -> PathBuf {
+        self.data_base.join("security.json")
+    }
+
+    fn load_guard(&self) -> GuardState {
+        fs::read(self.guard_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<GuardFile>(&b).ok())
+            .and_then(|f| f.vaults.get(&self.current_vault_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// 把当前内存中的防爆破计数写回 security.json（按保险箱 id 隔离）。
+    fn persist_guard(&self) {
+        let mut file = fs::read(self.guard_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<GuardFile>(&b).ok())
+            .unwrap_or_default();
+        file.vaults.insert(
+            self.current_vault_id.clone(),
+            GuardState {
+                failed_attempts: self.failed_attempts,
+                lockout_until: self.lockout_until,
+                recovery_failed_attempts: self.recovery_failed_attempts,
+                recovery_lockout_until: self.recovery_lockout_until,
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&file) {
+            let _ = atomic_write(&self.guard_path(), &bytes);
+        }
+    }
+
+    /// 以落盘数据为准刷新计数，确保重启应用或多保险箱切换后冷却状态不被绕过。
+    fn refresh_guard(&mut self) {
+        let g = self.load_guard();
+        self.failed_attempts = g.failed_attempts;
+        self.lockout_until = g.lockout_until;
+        self.recovery_failed_attempts = g.recovery_failed_attempts;
+        self.recovery_lockout_until = g.recovery_lockout_until;
+    }
+
+    fn lockout_cooldown(attempts: u32) -> i64 {
+        match attempts {
+            0..=2 => 0,
+            3..=4 => 5,
+            5..=7 => 30,
+            8..=9 => 60,
+            _ => 300,
+        }
+    }
+
+    /// 记录一次有效操作时间；Rust 侧后台线程据此判断空闲超时。
+    fn touch(&self) {
+        self.last_activity.set(Utc::now().timestamp());
+    }
+
+    /// 前端用户活动心跳（mousemove/keydown 等），让 Rust 权威自动锁
+    /// 能感知"用户仍在操作"，而不是仅统计会触发命令的操作。
+    pub fn touch_activity(&self) {
+        if self.is_unlocked {
+            self.touch();
+        }
+    }
+
+    /// 权威空闲自动锁定：由后台线程周期调用，不依赖前端计时器。
+    pub fn enforce_auto_lock(&mut self) {
+        if !self.is_unlocked || self.auto_lock_minutes == 0 {
+            return;
+        }
+        let idle = Utc::now().timestamp() - self.last_activity.get();
+        if idle >= (self.auto_lock_minutes as i64) * 60 {
+            self.lock();
+        }
+    }
+
     fn require_unlocked(&self) -> Result<[u8; 32], String> {
         if !self.is_unlocked {
             return Err("保险箱尚未解锁".into());
         }
+        self.touch();
         self.master_key.ok_or_else(|| "主密钥缺失".into())
     }
 
@@ -238,7 +409,8 @@ impl VaultManager {
         if password.is_empty() {
             return Err("密码不能为空".into());
         }
-        fs::create_dir_all(&self.data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
+        validate_password_strength(password)?;
+        create_private_dir(&self.data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
 
         // 随机主密钥
         let master_key: [u8; 32] = crypto::random_bytes(32)
@@ -264,6 +436,7 @@ impl VaultManager {
             recovery_salt,
             recovery_wrap,
             iterations: Some(crypto::PBKDF2_ITERATIONS),
+            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
         };
         let keyring_json =
             serde_json::to_vec(&keyring).map_err(|e| format!("序列化 keyring 失败: {e}"))?;
@@ -274,6 +447,12 @@ impl VaultManager {
         self.entries = Vec::new();
         self.master_key = Some(master_key);
         self.is_unlocked = true;
+        self.failed_attempts = 0;
+        self.lockout_until = None;
+        self.recovery_failed_attempts = 0;
+        self.recovery_lockout_until = None;
+        self.persist_guard();
+        self.touch();
         self.save_index()?;
 
         if remember {
@@ -296,6 +475,8 @@ impl VaultManager {
             return Err("保险箱尚未设置密码".into());
         }
 
+        // 以落盘状态为准，避免重启应用绕过安全冷却。
+        self.refresh_guard();
         let now = Utc::now().timestamp();
         if let Some(lockout) = self.lockout_until {
             if now < lockout {
@@ -318,18 +499,18 @@ impl VaultManager {
             Ok(mk) => {
                 self.failed_attempts = 0;
                 self.lockout_until = None;
+                self.persist_guard();
                 mk
             }
             Err(_) => {
                 self.failed_attempts += 1;
-                let cooldown = match self.failed_attempts {
-                    0..=2 => 0,
-                    3..=4 => 5,
-                    5..=7 => 30,
-                    _ => 60,
-                };
+                let cooldown = Self::lockout_cooldown(self.failed_attempts);
                 if cooldown > 0 {
-                    self.lockout_until = Some(now + cooldown);
+                    // 以判定失败的当前时刻起算，避免 KDF 耗时（尤其是旧设备/调试构建）侵蚀冷却窗口。
+                    self.lockout_until = Some(Utc::now().timestamp() + cooldown);
+                }
+                self.persist_guard();
+                if cooldown > 0 {
                     return Err(format!(
                         "密码错误！已连续输错 {} 次，安全保护触发，请等待 {} 秒后再试",
                         self.failed_attempts, cooldown
@@ -344,6 +525,7 @@ impl VaultManager {
         self.master_key = Some(master_key);
         self.entries = self.load_index_with_key(&master_key)?;
         self.is_unlocked = true;
+        self.touch();
 
         if remember {
             let _ = keychain::save_password(&self.current_vault_id, password, use_biometry);
@@ -357,9 +539,19 @@ impl VaultManager {
         let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
         let keyring_bytes =
             fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
-        let mut keyring: Keyring =
+        let keyring: Keyring =
             serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
-        let iters = keyring.iterations.unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+
+        // 旧版 keyring 未记录 iterations 时使用历史值 600,000；
+        // 恢复码包装当时与密码包装共用同一参数。
+        let iters = keyring
+            .iterations
+            .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+        let recovery_iters = keyring
+            .recovery_iterations
+            .or(keyring.iterations)
+            .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+
         let mut kek = crypto::derive_key_password_with_iter(password, &salt, iters);
         let mk_bytes = crypto::decrypt(&keyring.password_wrap, &kek)?;
         crypto::zeroize_slice(&mut kek);
@@ -369,18 +561,23 @@ impl VaultManager {
         let mut mk = [0u8; 32];
         mk.copy_from_slice(&mk_bytes);
 
-        // 如果旧版 keyring 未显式记录 iterations（即使用了 600,000 次），成功解密后自动升级为 100,000 次
-        if keyring.iterations.is_none() || keyring.iterations != Some(crypto::PBKDF2_ITERATIONS) {
-            let mut new_kek = crypto::derive_key_password_with_iter(password, &salt, crypto::PBKDF2_ITERATIONS);
-            if let Ok(new_wrap) = crypto::encrypt(&mk, &new_kek) {
-                crypto::zeroize_slice(&mut new_kek);
-                keyring.password_wrap = new_wrap;
-                keyring.iterations = Some(crypto::PBKDF2_ITERATIONS);
-                if let Ok(bytes) = serde_json::to_vec(&keyring) {
+        // 仅单向升级：迭代次数低于当前目标时才用更高参数重新包装，绝不降低强度。
+        // 恢复码包装在不知道恢复码的情况下无法同步升级，因此原样保留其旧参数。
+        if iters < crypto::PBKDF2_ITERATIONS {
+            let mut new_kek =
+                crypto::derive_key_password_with_iter(password, &salt, crypto::PBKDF2_ITERATIONS);
+            let upgraded = crypto::encrypt(&mk, &new_kek);
+            crypto::zeroize_slice(&mut new_kek);
+            // 升级失败不影响本次解锁，下次解锁会再次尝试。
+            if let Ok(new_wrap) = upgraded {
+                let mut updated = keyring.clone();
+                updated.version = KEYRING_VERSION;
+                updated.password_wrap = new_wrap;
+                updated.iterations = Some(crypto::PBKDF2_ITERATIONS);
+                updated.recovery_iterations = Some(recovery_iters);
+                if let Ok(bytes) = serde_json::to_vec(&updated) {
                     let _ = atomic_write(&self.keyring_path(), &bytes);
                 }
-            } else {
-                crypto::zeroize_slice(&mut new_kek);
             }
         }
 
@@ -392,7 +589,13 @@ impl VaultManager {
             fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
         let keyring: Keyring =
             serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
-        let mut kek = crypto::derive_key_recovery(code, &keyring.recovery_salt);
+        // 恢复码包装使用 keyring 中记录的参数；缺失时回退到与密码包装相同的值。
+        let iters = keyring
+            .recovery_iterations
+            .or(keyring.iterations)
+            .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+        let mut kek =
+            crypto::derive_key_recovery_with_iter(code, &keyring.recovery_salt, iters);
         let mk_bytes = crypto::decrypt(&keyring.recovery_wrap, &kek)?;
         crypto::zeroize_slice(&mut kek);
         if mk_bytes.len() != 32 {
@@ -427,6 +630,7 @@ impl VaultManager {
             recovery_salt,
             recovery_wrap,
             iterations: Some(crypto::PBKDF2_ITERATIONS),
+            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -541,9 +745,13 @@ impl VaultManager {
         self.data_dir = self.vault_dir.join("data");
         self.temp_dir = self.vault_dir.join("tmp");
 
-        let _ = fs::create_dir_all(&self.data_dir);
-        let _ = fs::create_dir_all(&self.temp_dir);
+        let _ = create_private_dir(&self.data_dir);
+        let _ = create_private_dir(&self.temp_dir);
         let _ = self.clear_temp();
+
+        // 切换后以目标保险箱的落盘状态刷新防爆破计数
+        self.refresh_guard();
+        self.touch();
 
         // 更新应用配置中的当前活跃保险箱
         let mut cfg = load_config(&self.config_path).unwrap_or_default();
@@ -619,6 +827,8 @@ impl VaultManager {
 
     /// 多保险箱：删除保险箱（保留至少一个）
     pub fn delete_vault(&mut self, vault_id: &str) -> Result<VaultInfo, String> {
+        // 破坏性操作：必须处于已解锁状态，避免锁定态下被静默清空数据。
+        self.require_unlocked()?;
         let mut profiles = load_vault_profiles(&self.data_base);
         if profiles.len() <= 1 {
             return Err("至少需要保留一个保险箱，无法删除".into());
@@ -656,7 +866,7 @@ impl VaultManager {
     /// 添加文件/文件夹：支持超大文件流式分块加密，内存占用恒定 ~4MB，支持任意 GB 级大文件。
     pub fn add_files(&mut self, paths: Vec<String>) -> Result<Vec<VaultEntry>, String> {
         let mk = self.require_unlocked()?;
-        fs::create_dir_all(&self.data_dir).map_err(|e| format!("创建 data 目录失败: {e}"))?;
+        create_private_dir(&self.data_dir).map_err(|e| format!("创建 data 目录失败: {e}"))?;
 
         let existing = self.entries.clone();
         let mut added: Vec<VaultEntry> = Vec::new();
@@ -789,19 +999,32 @@ impl VaultManager {
             .ok_or_else(|| "条目不存在".to_string())?;
         let mk = self.require_unlocked()?;
         let blob_path = self.data_dir.join(&entry.cipher_path);
-        fs::create_dir_all(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+        create_private_dir(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
         let target = if entry.kind == "folder" {
             let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
             let work = self.temp_dir.join(Uuid::new_v4().to_string());
-            fs::create_dir_all(&work).map_err(|e| format!("创建临时目录失败: {e}"))?;
-            Self::extract_folder_to(&data, &entry.name, &work)?
+            create_private_dir(&work).map_err(|e| format!("创建临时目录失败: {e}"))?;
+            match Self::extract_folder_to(&data, &entry.name, &work) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    remove_plain_path(&work);
+                    return Err(e);
+                }
+            }
         } else {
             let target_path = Self::unique_path(&self.temp_dir, &entry.name);
+            create_private_file(&target_path).map_err(|e| format!("创建临时文件失败: {e}"))?;
             crypto::decrypt_file_stream(&blob_path, &target_path, &mk)?;
             target_path
         };
-        vfs::open_path(&target)
+
+        if let Err(e) = vfs::open_path(&target) {
+            // 打开失败时清理已解密出的临时明文，避免残留
+            remove_plain_path(&target);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn export_entry(&self, id: &str, target_path: &str) -> Result<(), String> {
@@ -895,6 +1118,7 @@ impl VaultManager {
     }
 
     pub fn delete_entry(&mut self, id: &str) -> Result<(), String> {
+        self.require_unlocked()?;
         if !self.entries.iter().any(|e| e.id == id) {
             return Err("条目不存在".to_string());
         }
@@ -904,6 +1128,7 @@ impl VaultManager {
     }
 
     pub fn delete_entries(&mut self, ids: &[String]) -> Result<(), String> {
+        self.require_unlocked()?;
         for id in ids {
             self.delete_stored_entry(id);
         }
@@ -926,6 +1151,7 @@ impl VaultManager {
 
     pub fn change_password(&mut self, old: &str, new: &str) -> Result<String, String> {
         let mk = self.require_unlocked()?;
+        validate_password_strength(new)?;
         if self.keyring_path().exists() {
             let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
             let keyring_bytes = fs::read(self.keyring_path())
@@ -961,7 +1187,44 @@ impl VaultManager {
         if !self.keyring_path().exists() {
             return Err("该保险箱未设置恢复码，无法通过恢复码重置".into());
         }
-        let mk = self.unwrap_with_recovery(recovery_code)?;
+        validate_password_strength(new_password)?;
+
+        // 恢复码同样需要限流，否则可被无限次尝试而绕过密码侧的冷却保护。
+        self.refresh_guard();
+        let now = Utc::now().timestamp();
+        if let Some(lockout) = self.recovery_lockout_until {
+            if now < lockout {
+                let remaining = lockout - now;
+                return Err(format!("恢复码输错次数过多，安全保护中，请等待 {remaining} 秒后再试"));
+            } else {
+                self.recovery_lockout_until = None;
+            }
+        }
+
+        let mk = match self.unwrap_with_recovery(recovery_code) {
+            Ok(mk) => {
+                self.recovery_failed_attempts = 0;
+                self.recovery_lockout_until = None;
+                self.persist_guard();
+                mk
+            }
+            Err(_) => {
+                self.recovery_failed_attempts += 1;
+                let cooldown = Self::lockout_cooldown(self.recovery_failed_attempts);
+                if cooldown > 0 {
+                    self.recovery_lockout_until = Some(Utc::now().timestamp() + cooldown);
+                }
+                self.persist_guard();
+                if cooldown > 0 {
+                    return Err(format!(
+                        "恢复码错误！已连续输错 {} 次，安全保护触发，请等待 {} 秒后再试",
+                        self.recovery_failed_attempts, cooldown
+                    ));
+                }
+                let tries_left = 3 - self.recovery_failed_attempts;
+                return Err(format!("恢复码错误！剩余 {} 次尝试后将触发安全冷却延迟", tries_left));
+            }
+        };
         let _ = self.load_index_with_key(&mk)?;
         let new_recovery = crypto::generate_recovery_code();
         self.rewrite_keyring(&mk, new_password, &new_recovery)?;
@@ -971,6 +1234,10 @@ impl VaultManager {
         self.master_key = Some(mk);
         self.entries = self.load_index_with_key(&mk)?;
         self.is_unlocked = true;
+        self.failed_attempts = 0;
+        self.lockout_until = None;
+        self.persist_guard();
+        self.touch();
         Ok(new_recovery)
     }
 
@@ -996,6 +1263,7 @@ impl VaultManager {
             recovery_salt,
             recovery_wrap,
             iterations: Some(crypto::PBKDF2_ITERATIONS),
+            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -1012,7 +1280,7 @@ impl VaultManager {
             .ok_or_else(|| "条目不存在".to_string())?;
         let mk = self.require_unlocked()?;
         let blob_path = self.data_dir.join(&entry.cipher_path);
-        fs::create_dir_all(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+        create_private_dir(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
         let name = if entry.kind == "folder" {
             format!("{}.zip", entry.name)
@@ -1026,8 +1294,13 @@ impl VaultManager {
 
         if entry.kind == "folder" {
             let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
-            fs::write(&target, &data).map_err(|e| format!("写入临时文件失败: {e}"))?;
+            create_private_file(&target).map_err(|e| format!("创建临时文件失败: {e}"))?;
+            if let Err(e) = fs::write(&target, &data) {
+                remove_plain_path(&target);
+                return Err(format!("写入临时文件失败: {e}"));
+            }
         } else {
+            create_private_file(&target).map_err(|e| format!("创建临时文件失败: {e}"))?;
             crypto::decrypt_file_stream(&blob_path, &target, &mk)?;
         }
 
@@ -1110,6 +1383,8 @@ impl VaultManager {
     }
 
     pub fn reset_vault(&mut self) -> Result<(), String> {
+        // 破坏性操作：必须处于已解锁状态，避免锁定态下被静默清空数据。
+        self.require_unlocked()?;
         if self.vault_dir.exists() {
             fs::remove_dir_all(&self.vault_dir)
                 .map_err(|e| format!("删除 vault 目录失败: {e}"))?;
@@ -1121,8 +1396,8 @@ impl VaultManager {
         self.entries.clear();
         self.master_key = None;
         self.is_unlocked = false;
-        let _ = fs::create_dir_all(&self.data_dir);
-        let _ = fs::create_dir_all(&self.temp_dir);
+        let _ = create_private_dir(&self.data_dir);
+        let _ = create_private_dir(&self.temp_dir);
         Ok(())
     }
 
@@ -1211,6 +1486,37 @@ fn zip_directory(dir: &Path) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// 构造测试用 VaultManager：security.json 位于 base 根目录，各保险箱数据在 base/<id> 下。
+    fn make_test_vm(base: &std::path::Path, vault_id: &str) -> VaultManager {
+        let vault_dir = base.join(vault_id);
+        let data_dir = vault_dir.join("data");
+        let temp_sub = vault_dir.join("tmp");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&temp_sub).unwrap();
+        VaultManager {
+            entries: Vec::new(),
+            master_key: None,
+            is_unlocked: false,
+            data_base: base.to_path_buf(),
+            current_vault_id: vault_id.into(),
+            current_vault_name: "测试保险箱".into(),
+            vault_dir,
+            data_dir,
+            temp_dir: temp_sub,
+            config_path: base.join("config.json"),
+            auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
+        }
+    }
+
+    fn tmp_base(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("filelocker_{tag}_{}", Uuid::new_v4()))
+    }
+
     #[test]
     fn test_atomic_write() {
         let temp_dir = std::env::temp_dir().join(format!("filelocker_test_{}", Uuid::new_v4()));
@@ -1277,6 +1583,9 @@ mod tests {
             auto_lock_minutes: 5,
             failed_attempts: 0,
             lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
         };
 
         vm.entries.push(VaultEntry {
@@ -1326,6 +1635,9 @@ mod tests {
             auto_lock_minutes: 5,
             failed_attempts: 0,
             lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
         };
 
         vm.entries.push(VaultEntry {
@@ -1390,7 +1702,14 @@ mod tests {
             auto_lock_minutes: 5,
             failed_attempts: 0,
             lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
         };
+
+        // 默认保险箱先初始化密码（后续删除保护需在解锁态验证）
+        vm.set_password("DefaultPass123!", false, false).unwrap();
+        vm.lock();
 
         // 初始保险箱列表包含默认保险箱
         let list = vm.list_vaults().unwrap();
@@ -1399,7 +1718,7 @@ mod tests {
         assert_eq!(list[0].name, "默认保险箱");
 
         // 创建新保险箱 "工作保险箱"
-        let create_res = vm.create_vault("工作保险箱", "password123", false, false).unwrap();
+        let create_res = vm.create_vault("工作保险箱", "WorkPass123!", false, false).unwrap();
         assert_eq!(create_res.vault.name, "工作保险箱");
         assert_eq!(vm.current_vault_name, "工作保险箱");
         assert!(vm.is_unlocked);
@@ -1420,6 +1739,10 @@ mod tests {
         // 切换后保险箱处于锁定状态
         assert!(!vm.is_unlocked);
 
+        // 删除前需处于解锁态：切回待删除的保险箱并解锁
+        vm.switch_vault(&current_id).unwrap();
+        vm.unlock("WorkPass123!", false, false).unwrap();
+
         // 删除刚创建的工作保险箱
         let after_delete = vm.delete_vault(&current_id).unwrap();
         assert_eq!(after_delete.id, "default");
@@ -1427,6 +1750,7 @@ mod tests {
         assert_eq!(list3.len(), 1);
 
         // 仅剩一个保险箱时，尝试删除应该报错保护
+        vm.unlock("DefaultPass123!", false, false).unwrap();
         assert!(vm.delete_vault("default").is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1469,6 +1793,9 @@ mod tests {
             auto_lock_minutes: 5,
             failed_attempts: 0,
             lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
         };
 
         vm.set_password("CorrectPassword123!", false, false).unwrap();
@@ -1489,5 +1816,174 @@ mod tests {
         assert!(blocked.contains("安全保护中"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_kdf_upgrade_from_weak_iterations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_kdf_test_{}", Uuid::new_v4()));
+        let vault_dir = temp_dir.join("vault");
+        let data_dir = vault_dir.join("data");
+        let temp_sub = vault_dir.join("tmp");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&temp_sub).unwrap();
+
+        let mut vm = VaultManager {
+            entries: Vec::new(),
+            master_key: None,
+            is_unlocked: false,
+            data_base: temp_dir.clone(),
+            current_vault_id: "default".into(),
+            current_vault_name: "默认保险箱".into(),
+            vault_dir: vault_dir.clone(),
+            data_dir,
+            temp_dir: temp_sub,
+            config_path: temp_dir.join("config.json"),
+            auto_lock_minutes: 5,
+            failed_attempts: 0,
+            lockout_until: None,
+            recovery_failed_attempts: 0,
+            recovery_lockout_until: None,
+            last_activity: Cell::new(Utc::now().timestamp()),
+        };
+
+        let recovery_code = vm.set_password("OldPassword123!", false, false).unwrap();
+        let mk = vm.master_key.unwrap();
+
+        // 伪造一个使用 100,000 次迭代的旧版 keyring（不记录 recovery_iterations）
+        let salt = fs::read(vm.salt_path()).unwrap();
+        let mut password_kek =
+            crypto::derive_key_password_with_iter("OldPassword123!", &salt, 100_000);
+        let password_wrap = crypto::encrypt(&mk, &password_kek).unwrap();
+        crypto::zeroize_slice(&mut password_kek);
+        let recovery_salt = crypto::random_bytes(crypto::SALT_LEN);
+        let mut recovery_kek =
+            crypto::derive_key_recovery_with_iter(&recovery_code, &recovery_salt, 100_000);
+        let recovery_wrap = crypto::encrypt(&mk, &recovery_kek).unwrap();
+        crypto::zeroize_slice(&mut recovery_kek);
+        let legacy = Keyring {
+            version: 2,
+            password_wrap,
+            recovery_salt,
+            recovery_wrap,
+            iterations: Some(100_000),
+            recovery_iterations: None,
+        };
+        atomic_write(&vm.keyring_path(), &serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        // 解锁成功后应单向升级到 600,000，且绝不降到 100,000
+        vm.lock();
+        vm.unlock("OldPassword123!", false, false).unwrap();
+        let upgraded: Keyring =
+            serde_json::from_slice(&fs::read(vm.keyring_path()).unwrap()).unwrap();
+        assert_eq!(upgraded.version, KEYRING_VERSION);
+        assert_eq!(upgraded.iterations, Some(crypto::PBKDF2_ITERATIONS));
+        assert_eq!(upgraded.recovery_iterations, Some(100_000));
+
+        // 升级后旧恢复码仍然有效
+        vm.lock();
+        assert!(vm
+            .recover_password(&recovery_code, "NewPassword123!")
+            .unwrap()
+            .len() > 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_guard_state_persists_across_restart() {
+        let base = tmp_base("guard");
+        let mut vm = make_test_vm(&base, "vault-a");
+        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.lock();
+
+        for _ in 0..3 {
+            assert!(vm.unlock("wrong", false, false).is_err());
+        }
+        assert!(vm.lockout_until.is_some());
+
+        // 模拟重启：新实例从 security.json 恢复冷却，无法通过重启绕过
+        let mut restarted = make_test_vm(&base, "vault-a");
+        let err = restarted
+            .unlock("CorrectPassword123!", false, false)
+            .unwrap_err();
+        assert!(err.contains("安全保护中"), "实际错误: {err}");
+
+        // 冷却按保险箱隔离：另一个保险箱不应受牵连
+        let mut other = make_test_vm(&base, "vault-b");
+        let other_err = other.unlock("CorrectPassword123!", false, false).unwrap_err();
+        assert!(!other_err.contains("安全保护中"), "实际错误: {other_err}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_recovery_rate_limiting() {
+        let base = tmp_base("recovery_guard");
+        let mut vm = make_test_vm(&base, "vault-a");
+        let recovery_code = vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.lock();
+
+        for _ in 0..2 {
+            assert!(vm.recover_password("WRONG-CODE", "NewPassword123!").is_err());
+        }
+        let err = vm
+            .recover_password("WRONG-CODE", "NewPassword123!")
+            .unwrap_err();
+        assert!(err.contains("安全保护触发"), "实际错误: {err}");
+        assert_eq!(vm.recovery_failed_attempts, 3);
+        assert!(vm.recovery_lockout_until.is_some());
+
+        // 冷却期内即使恢复码正确也被拒绝
+        let blocked = vm
+            .recover_password(&recovery_code, "NewPassword123!")
+            .unwrap_err();
+        assert!(blocked.contains("安全保护中"), "实际错误: {blocked}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_destructive_ops_require_unlock() {
+        let base = tmp_base("destructive_guard");
+        let mut vm = make_test_vm(&base, "vault-a");
+        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.lock();
+
+        assert!(vm.reset_vault().unwrap_err().contains("尚未解锁"));
+        assert!(vm.delete_entry("whatever").unwrap_err().contains("尚未解锁"));
+        assert!(vm
+            .delete_entries(&["a".to_string()])
+            .unwrap_err()
+            .contains("尚未解锁"));
+        assert!(vm.delete_vault("vault-a").unwrap_err().contains("尚未解锁"));
+
+        // 数据未被破坏
+        assert!(vm.vault_exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_password_strength_policy() {
+        let base = tmp_base("pwd_policy");
+        let mut vm = make_test_vm(&base, "vault-a");
+
+        assert!(vm.set_password("short", false, false).unwrap_err().contains("至少"));
+        assert!(vm
+            .set_password("12345678", false, false)
+            .unwrap_err()
+            .contains("过于简单"));
+        assert!(vm
+            .set_password("83920174", false, false)
+            .unwrap_err()
+            .contains("纯数字"));
+        assert!(vm
+            .set_password("aaaaaaaa", false, false)
+            .unwrap_err()
+            .contains("相同字符"));
+        assert!(vm.set_password("StrongPass123!", false, false).is_ok());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

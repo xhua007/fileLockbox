@@ -5,7 +5,9 @@ pub mod models;
 pub mod vault;
 
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::time::Duration;
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::models::{CreateVaultResult, VaultEntry, VaultInfo};
 use crate::vault::VaultManager;
@@ -46,6 +48,14 @@ fn lock(state: State<VaultState>) -> Result<(), String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.lock();
     Ok(())
+}
+
+/// 用户活动心跳：前端在鼠标/键盘活动时调用，供 Rust 侧权威自动锁判断空闲。
+#[tauri::command]
+fn touch_activity(state: State<VaultState>) {
+    if let Ok(v) = state.lock() {
+        v.touch_activity();
+    }
 }
 
 #[tauri::command]
@@ -234,19 +244,118 @@ fn delete_vault(vault_id: String, state: State<VaultState>) -> Result<VaultInfo,
     v.delete_vault(&vault_id)
 }
 
+// ---------- 原生文件对话框（仅由 Rust 侧调用，前端无 dialog 权限）----------
+
+#[tauri::command]
+async fn pick_paths(
+    app: tauri::AppHandle,
+    directory: bool,
+    multiple: bool,
+) -> Result<Vec<String>, String> {
+    let dialog = app.dialog().file().set_title(if directory {
+        "选择文件夹"
+    } else {
+        "选择文件"
+    });
+    let picked: Vec<tauri_plugin_dialog::FilePath> = if directory {
+        if multiple {
+            dialog.blocking_pick_folders().unwrap_or_default()
+        } else {
+            dialog.blocking_pick_folder().into_iter().collect()
+        }
+    } else if multiple {
+        dialog.blocking_pick_files().unwrap_or_default()
+    } else {
+        dialog.blocking_pick_file().into_iter().collect()
+    };
+    Ok(picked
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[tauri::command]
+async fn pick_save_path(
+    app: tauri::AppHandle,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("导出文件")
+        .set_file_name(default_name)
+        .blocking_save_file();
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// 单实例保护：在应用数据目录下绑定 Unix socket。
+/// 返回 None 表示已有实例在运行；返回 Some 时监听器需一直持有到进程退出。
+#[cfg(unix)]
+fn acquire_single_instance() -> Option<std::os::unix::net::UnixListener> {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let path = vault::app_data_dir().join("instance.sock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 先探测是否已有活着的实例；socket 文件残留（上次崩溃）时清理后重绑
+    if UnixStream::connect(&path).is_ok() {
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+    UnixListener::bind(&path).ok()
+}
+
 /// Tauri 应用构建入口。main.rs 通过 `filelocker_lib::run()` 调用。
 pub fn run() {
+    #[cfg(unix)]
+    let _instance_guard = match acquire_single_instance() {
+        Some(listener) => listener,
+        None => {
+            eprintln!("已有 FileLocker 实例在运行，本次启动退出");
+            return;
+        }
+    };
+
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_os::init())
         .manage(Mutex::new(VaultManager::new()))
+        .setup(|app| {
+            // Rust 侧权威自动锁：不依赖前端计时器，前端被绕过也无法阻止空闲锁定。
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut was_unlocked = false;
+                loop {
+                    std::thread::sleep(Duration::from_secs(10));
+                    let unlocked = {
+                        let state = handle.state::<VaultState>();
+                        let result = match state.lock() {
+                            Ok(mut v) => {
+                                v.enforce_auto_lock();
+                                v.is_unlocked
+                            }
+                            Err(_) => false,
+                        };
+                        result
+                    };
+                    if was_unlocked && !unlocked {
+                        let _ = handle.emit("vault-auto-locked", ());
+                    }
+                    was_unlocked = unlocked;
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            pick_paths,
+            pick_save_path,
             vault_exists,
             setup_password,
             unlock,
             lock,
+            touch_activity,
             is_unlocked,
             has_saved_password,
             biometric_unlock,

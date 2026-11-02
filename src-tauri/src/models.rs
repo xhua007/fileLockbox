@@ -24,8 +24,13 @@ pub struct Keyring {
     pub password_wrap: Vec<u8>,
     pub recovery_salt: Vec<u8>,
     pub recovery_wrap: Vec<u8>,
+    /// password_wrap 的 PBKDF2 迭代次数。缺失表示旧版固定 600,000 次。
     #[serde(default)]
     pub iterations: Option<u32>,
+    /// recovery_wrap 的 PBKDF2 迭代次数。缺失表示与 `iterations` 相同。
+    /// 单独记录是因为恢复码包装无法在未知恢复码时随密码包装一起升级。
+    #[serde(default)]
+    pub recovery_iterations: Option<u32>,
 }
 
 /// 索引加密落盘格式：nonce + ciphertext。
