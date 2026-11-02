@@ -25,31 +25,84 @@ pub fn move_to_trash<P: AsRef<Path>>(path: P) -> Result<(), String> {
 }
 
 /// 用系统默认程序打开文件。
+///
+/// 各平台均以「参数数组」方式传路径，不经过 shell 解析，
+/// 避免路径中的 `& | ^ % "` 等字符被二次解释成命令。
 pub fn open_path<P: AsRef<Path>>(path: P) -> Result<(), String> {
     let p = path.as_ref();
-    #[cfg(target_os = "macos")]
-    let status = std::process::Command::new("open")
-        .arg(p)
-        .status()
-        .map_err(|e| format!("执行 open 命令失败: {e}"))?;
-    #[cfg(target_os = "windows")]
-    let status = {
-        // cmd /c start 对路径中空格/中文兼容较好；"" 是窗口标题占位。
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &p.to_string_lossy()])
-            .status()
-            .map_err(|e| format!("执行 start 命令失败: {e}"))?
-    };
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let status = std::process::Command::new("xdg-open")
-        .arg(p)
-        .status()
-        .map_err(|e| format!("执行 xdg-open 失败: {e}"))?;
 
-    if status.success() {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg(p)
+            .status()
+            .map_err(|e| format!("执行 open 命令失败: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("打开命令返回非零状态: {:?}", status.code()))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // 直接调用 ShellExecuteW，不经 cmd.exe / start，路径不会被当作命令行再次解析。
+        windows_shell_open(p)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let status = std::process::Command::new("xdg-open")
+            .arg(p)
+            .status()
+            .map_err(|e| format!("执行 xdg-open 失败: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("打开命令返回非零状态: {:?}", status.code()))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_open(p: &Path) -> Result<(), String> {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    // ShellExecuteW 的返回值为 HINSTANCE，> 32 表示成功。
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let operation = wide(OsStr::new("open"));
+    let file = wide(p.as_os_str());
+    // SW_SHOWNORMAL = 1
+    let ret = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if ret as isize > 32 {
         Ok(())
     } else {
-        Err(format!("打开命令返回非零状态: {:?}", status.code()))
+        Err(format!("系统无法打开该文件（ShellExecuteW 返回 {}）", ret as isize))
     }
 }
 

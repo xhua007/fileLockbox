@@ -85,38 +85,48 @@ fn validate_password_strength(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 安全粉碎文件：用 0 字节覆写数据并执行 sync_all 强制刷盘，最后从文件系统删除，
-/// 防止物理扇区残留明文数据被数据恢复工具或取证工具提取。
-fn secure_shred_file(path: &Path) -> std::io::Result<()> {
-    if let Ok(meta) = fs::metadata(path) {
-        let len = meta.len();
-        if len > 0 {
-            if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
-                use std::io::Write;
-                let chunk_size = 64 * 1024;
-                let zeros = vec![0u8; chunk_size];
-                let mut written = 0u64;
-                while written < len {
-                    let to_write = (chunk_size as u64).min(len - written) as usize;
-                    let _ = f.write_all(&zeros[..to_write]);
-                    written += to_write as u64;
-                }
-                let _ = f.sync_all();
+/// 尽力擦除文件：先把内容覆写为 0 并 `sync_all`，再从文件系统删除。
+///
+/// 注意：这只是**尽力而为**的清理，不代表物理介质上的数据一定被覆盖。
+/// 在 SSD（TRIM / 磨损均衡）、写时复制文件系统（APFS / Btrfs）、
+/// 开启快照或日志的文件系统上，覆写同一逻辑偏移无法保证抹掉底层旧数据。
+/// 因此安全边界应建立在加密上：本应用落盘的 blob 均为密文，
+/// 删除后不残留可读明文；此函数仅用于收尾清理临时解密出的明文。
+fn best_effort_erase_file(path: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    // 符号链接只删除链接本身，避免顺着链接覆写外部文件。
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(path);
+    }
+    let len = meta.len();
+    if len > 0 {
+        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
+            use std::io::Write;
+            let chunk_size = 64 * 1024;
+            let zeros = vec![0u8; chunk_size];
+            let mut written = 0u64;
+            while written < len {
+                let to_write = (chunk_size as u64).min(len - written) as usize;
+                let _ = f.write_all(&zeros[..to_write]);
+                written += to_write as u64;
             }
+            let _ = f.sync_all();
         }
     }
     fs::remove_file(path)
 }
 
-fn secure_shred_dir_recursive(dir: &Path) {
+fn best_effort_erase_dir(dir: &Path) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
-                secure_shred_dir_recursive(&p);
+            // 使用 DirEntry::file_type（不跟随符号链接），避免符号链接环导致无限递归。
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                best_effort_erase_dir(&p);
                 let _ = fs::remove_dir(&p);
             } else {
-                let _ = secure_shred_file(&p);
+                let _ = best_effort_erase_file(&p);
             }
         }
     }
@@ -149,20 +159,62 @@ fn create_private_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 删除临时明文：文件覆写后删除，目录递归清理。
+/// 删除临时明文：文件先尽力覆写再删除，目录递归清理。
 fn remove_plain_path(path: &Path) {
     if path.is_dir() {
-        secure_shred_dir_recursive(path);
+        best_effort_erase_dir(path);
         let _ = fs::remove_dir(path);
     } else if path.exists() {
-        let _ = secure_shred_file(path);
+        let _ = best_effort_erase_file(path);
     }
 }
 
 /// 加密索引落盘的 JSON 外层结构（整个 entries 数组一次加密）。
 #[derive(Serialize, Deserialize)]
 struct IndexData {
+    /// 单调递增的索引代次。与钥匙串中的锚点比对，可发现旧索引被整体替换回来的回滚攻击。
+    /// 旧版本索引没有该字段，默认 0。
+    #[serde(default)]
+    generation: u64,
     entries: Vec<VaultEntry>,
+}
+
+/// 校验索引代次相对锚点没有倒退。
+fn check_index_generation(generation: u64, anchor: Option<u64>) -> Result<(), String> {
+    if let Some(anchor) = anchor {
+        if generation < anchor {
+            return Err(format!(
+                "检测到索引版本回滚（索引代次 {generation} < 期望 {anchor}），已拒绝加载。\
+                 若你并未手动还原过数据目录，请警惕本地文件被替换"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 代次锚点：优先使用系统钥匙串（位于应用数据目录之外，不易与索引一起被回滚）。
+/// 单元测试中禁用钥匙串锚点，避免测试之间（以及与本机真实保险箱之间）互相干扰。
+fn load_generation_anchor(vault_id: &str) -> Option<u64> {
+    #[cfg(not(test))]
+    {
+        keychain::load_index_generation(vault_id).ok()
+    }
+    #[cfg(test)]
+    {
+        let _ = vault_id;
+        None
+    }
+}
+
+fn store_generation_anchor(vault_id: &str, generation: u64) {
+    #[cfg(not(test))]
+    {
+        let _ = keychain::store_index_generation(vault_id, generation);
+    }
+    #[cfg(test)]
+    {
+        let _ = (vault_id, generation);
+    }
 }
 
 const KEYRING_VERSION: u32 = 3;
@@ -400,12 +452,7 @@ impl VaultManager {
     }
 
     /// 首次设置密码：生成随机 master_key，用密码/恢复码分别包装后落盘。
-    pub fn set_password(
-        &mut self,
-        password: &str,
-        remember: bool,
-        use_biometry: bool,
-    ) -> Result<String, String> {
+    pub fn set_password(&mut self, password: &str, remember: bool) -> Result<String, String> {
         if password.is_empty() {
             return Err("密码不能为空".into());
         }
@@ -456,7 +503,7 @@ impl VaultManager {
         self.save_index()?;
 
         if remember {
-            let _ = keychain::save_password(&self.current_vault_id, password, use_biometry);
+            let _ = keychain::save_password(&self.current_vault_id, password);
         } else {
             let _ = keychain::delete_password(&self.current_vault_id);
         }
@@ -465,12 +512,7 @@ impl VaultManager {
     }
 
     /// 用密码解锁（包含防暴力破解指数冷却保护）。
-    pub fn unlock(
-        &mut self,
-        password: &str,
-        remember: bool,
-        use_biometry: bool,
-    ) -> Result<Vec<VaultEntry>, String> {
+    pub fn unlock(&mut self, password: &str, remember: bool) -> Result<Vec<VaultEntry>, String> {
         if !self.vault_exists() {
             return Err("保险箱尚未设置密码".into());
         }
@@ -528,7 +570,7 @@ impl VaultManager {
         self.touch();
 
         if remember {
-            let _ = keychain::save_password(&self.current_vault_id, password, use_biometry);
+            let _ = keychain::save_password(&self.current_vault_id, password);
         } else {
             let _ = keychain::delete_password(&self.current_vault_id);
         }
@@ -651,9 +693,13 @@ impl VaultManager {
         keychain::has_saved_password(&self.current_vault_id)
     }
 
-    pub fn biometric_unlock(&mut self) -> Result<Vec<VaultEntry>, String> {
+    /// 使用系统钥匙串中已记住的密码解锁。
+    ///
+    /// 注意：这不是生物识别。凭据以明文密码形式存放在系统钥匙串中，
+    /// 能否免输入读取由系统钥匙串自身的访问控制决定。
+    pub fn unlock_with_keychain(&mut self) -> Result<Vec<VaultEntry>, String> {
         let pwd = keychain::load_password(&self.current_vault_id)?;
-        self.unlock(&pwd, false, false)
+        self.unlock(&pwd, false)
     }
 
     pub fn list_entries(&self) -> Result<Vec<VaultEntry>, String> {
@@ -769,7 +815,6 @@ impl VaultManager {
         name: &str,
         password: &str,
         remember: bool,
-        use_biometry: bool,
     ) -> Result<CreateVaultResult, String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -793,7 +838,7 @@ impl VaultManager {
         self.switch_vault(&new_id)?;
 
         // 初始化密码与主密钥
-        let recovery_code = self.set_password(password, remember, use_biometry)?;
+        let recovery_code = self.set_password(password, remember)?;
 
         Ok(CreateVaultResult {
             vault: self.get_current_vault_info(),
@@ -851,6 +896,7 @@ impl VaultManager {
             let _ = fs::remove_dir_all(&target_vdir);
         }
         let _ = keychain::delete_password(&removed.id);
+        let _ = keychain::delete_index_generation(&removed.id);
 
         save_vault_profiles(&self.data_base, &profiles)?;
 
@@ -900,10 +946,18 @@ impl VaultManager {
             let blob_path = self.data_dir.join(&blob_name);
 
             let (kind, size) = if is_dir {
-                let plain = zip_directory(&p)?;
-                let s = plain.len() as u64;
-                let cipher_blob = crypto::encrypt(&plain, &mk)?;
-                atomic_write(&blob_path, &cipher_blob)?;
+                // 文件夹先打包成临时 zip，再流式加密：内存占用不再等于文件夹总大小。
+                // 临时 zip 中为明文，用完立即尽力擦除。
+                create_private_dir(&self.temp_dir)
+                    .map_err(|e| format!("创建临时目录失败: {e}"))?;
+                let zip_path = self.temp_dir.join(format!("zip-{}.tmp", Uuid::new_v4()));
+                if let Err(e) = zip_directory_to_file(&p, &zip_path) {
+                    let _ = fs::remove_file(&zip_path);
+                    return Err(e);
+                }
+                let enc_result = crypto::encrypt_file_stream(&zip_path, &blob_path, &mk);
+                let _ = best_effort_erase_file(&zip_path);
+                let s = enc_result?;
                 ("folder".to_string(), s)
             } else {
                 // 超大文件流式分块加密，峰值内存占用仅 ~4MB，支持任意 GB 级文件
@@ -1140,7 +1194,7 @@ impl VaultManager {
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let entry = self.entries.remove(pos);
             let blob = self.data_dir.join(&entry.cipher_path);
-            let _ = secure_shred_file(&blob);
+            let _ = best_effort_erase_file(&blob);
         }
     }
 
@@ -1171,7 +1225,7 @@ impl VaultManager {
         let new_recovery = crypto::generate_recovery_code();
         self.rewrite_keyring(&mk, new, &new_recovery)?;
         if keychain::has_saved_password(&self.current_vault_id) {
-            let _ = keychain::save_password(&self.current_vault_id, new, false);
+            let _ = keychain::save_password(&self.current_vault_id, new);
         }
         Ok(new_recovery)
     }
@@ -1229,7 +1283,7 @@ impl VaultManager {
         let new_recovery = crypto::generate_recovery_code();
         self.rewrite_keyring(&mk, new_password, &new_recovery)?;
         if keychain::has_saved_password(&self.current_vault_id) {
-            let _ = keychain::save_password(&self.current_vault_id, new_password, false);
+            let _ = keychain::save_password(&self.current_vault_id, new_password);
         }
         self.master_key = Some(mk);
         self.entries = self.load_index_with_key(&mk)?;
@@ -1309,14 +1363,18 @@ impl VaultManager {
 
     pub fn clear_temp(&self) -> Result<(), String> {
         if self.temp_dir.exists() {
-            secure_shred_dir_recursive(&self.temp_dir);
+            best_effort_erase_dir(&self.temp_dir);
         }
         Ok(())
     }
 
     pub fn save_index(&self) -> Result<(), String> {
         let mk = self.master_key.ok_or_else(|| "主密钥缺失".to_string())?;
+        // 代次必须单调递增：以钥匙串锚点（其次现有索引）为基线 +1，
+        // 这样即便攻击者把旧 index.enc / index.enc.bak 复制回来，也会因代次过小而拒绝加载。
+        let generation = self.current_index_generation(&mk).saturating_add(1);
         let index = IndexData {
+            generation,
             entries: self.entries.clone(),
         };
         let json = serde_json::to_vec(&index).map_err(|e| format!("序列化索引失败: {e}"))?;
@@ -1329,7 +1387,34 @@ impl VaultManager {
         }
 
         atomic_write(&self.index_path(), &enc)?;
+        // 先落索引、后更新锚点：中途崩溃时索引代次会领先锚点，加载时按索引修复锚点即可。
+        store_generation_anchor(&self.current_vault_id, generation);
         Ok(())
+    }
+
+    /// 当前索引应基于的代次：优先取钥匙串锚点，其次读取现有索引内记录的值。
+    fn current_index_generation(&self, key: &[u8; 32]) -> u64 {
+        if let Some(anchor) = load_generation_anchor(&self.current_vault_id) {
+            return anchor;
+        }
+        if let Ok(enc) = fs::read(self.index_path()) {
+            if let Ok(json) = crypto::decrypt(&enc, key) {
+                if let Ok(index) = serde_json::from_slice::<IndexData>(&json) {
+                    return index.generation;
+                }
+            }
+        }
+        0
+    }
+
+    /// 校验索引代次未被回滚，接受后按需把锚点修复到索引当前代次。
+    fn accept_index(&self, index: IndexData) -> Result<Vec<VaultEntry>, String> {
+        let anchor = load_generation_anchor(&self.current_vault_id);
+        check_index_generation(index.generation, anchor)?;
+        if anchor != Some(index.generation) {
+            store_generation_anchor(&self.current_vault_id, index.generation);
+        }
+        Ok(index.entries)
     }
 
     fn load_index_with_key(&self, key: &[u8; 32]) -> Result<Vec<VaultEntry>, String> {
@@ -1350,7 +1435,7 @@ impl VaultManager {
             Ok(json) => {
                 let index: IndexData =
                     serde_json::from_slice(&json).map_err(|e| format!("解析索引失败: {e}"))?;
-                Ok(index.entries)
+                self.accept_index(index)
             }
             Err(primary_err) => {
                 let bak_path = self.vault_dir.join("index.enc.bak");
@@ -1358,8 +1443,10 @@ impl VaultManager {
                     if let Ok(bak_enc) = fs::read(&bak_path) {
                         if let Ok(json) = crypto::decrypt(&bak_enc, key) {
                             if let Ok(index) = serde_json::from_slice::<IndexData>(&json) {
+                                // 备份同样要通过代次校验，防止攻击者回滚整个目录。
+                                let entries = self.accept_index(index)?;
                                 let _ = fs::copy(&bak_path, self.index_path());
-                                return Ok(index.entries);
+                                return Ok(entries);
                             }
                         }
                     }
@@ -1390,6 +1477,9 @@ impl VaultManager {
                 .map_err(|e| format!("删除 vault 目录失败: {e}"))?;
         }
         let _ = keychain::delete_password(&self.current_vault_id);
+        // 与 delete_vault 一致：清空保险箱后同步移除索引代次锚点，
+        // 否则下次新建同名保险箱会因锚点残留而误判「索引回滚」。
+        let _ = keychain::delete_index_generation(&self.current_vault_id);
         if let Some(mut mk) = self.master_key.take() {
             crypto::zeroize_slice(&mut mk);
         }
@@ -1442,20 +1532,41 @@ fn default_documents_dir() -> Result<PathBuf, String> {
     Err("无法定位文档目录".into())
 }
 
-fn zip_directory(dir: &Path) -> Result<Vec<u8>, String> {
-    let mut buffer = Vec::new();
-    let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
+/// 把目录打包为 zip 并流式写入 `dest`，内存占用与文件夹总大小无关。
+///
+/// 安全处理：
+/// - 用 `DirEntry::file_type()`（lstat 语义）判断类型，**不跟随符号链接**：
+///   既避免链接环导致无限递归，也避免把目录树之外的敏感文件打进包里。
+/// - 用 `canonicalize` 记录已访问目录，遇到重复访问（硬链接目录 / 绑定挂载）直接跳过。
+fn zip_directory_to_file(dir: &Path, dest: &Path) -> Result<(), String> {
+    create_private_file(dest).map_err(|e| format!("创建临时 zip 失败: {e}"))?;
+    let file = fs::File::create(dest).map_err(|e| format!("打开临时 zip 失败: {e}"))?;
+    let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
     let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    fn add_dir(
-        zip: &mut ZipWriter<Cursor<&mut Vec<u8>>>,
+    fn add_dir<W: std::io::Write + std::io::Seek>(
+        zip: &mut ZipWriter<W>,
         root: &Path,
         current: &Path,
         options: &FileOptions<()>,
+        visited: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<(), String> {
+        let canon = fs::canonicalize(current)
+            .map_err(|e| format!("规范化目录路径失败 {}: {e}", current.display()))?;
+        if !visited.insert(canon) {
+            return Ok(());
+        }
+
         for entry in fs::read_dir(current).map_err(|e| format!("读取目录失败: {e}"))? {
             let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
             let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("读取条目类型失败: {e}"))?;
+            if ft.is_symlink() {
+                // 跳过符号链接：不跟随可避免链接环，也避免把外部目录内容打包进来。
+                continue;
+            }
             let relative = path
                 .strip_prefix(root)
                 .map_err(|e| format!("路径前缀无效: {e}"))?;
@@ -1463,23 +1574,30 @@ fn zip_directory(dir: &Path) -> Result<Vec<u8>, String> {
                 .to_str()
                 .ok_or_else(|| "非 UTF-8 路径名".to_string())?;
 
-            if path.is_dir() {
+            if ft.is_dir() {
                 zip.add_directory(rel_str, *options)
                     .map_err(|e| format!("写入 zip 目录失败: {e}"))?;
-                add_dir(zip, root, &path, options)?;
-            } else {
+                add_dir(zip, root, &path, options, visited)?;
+            } else if ft.is_file() {
                 zip.start_file(rel_str, *options)
                     .map_err(|e| format!("写入 zip 文件头失败: {e}"))?;
                 let mut f = fs::File::open(&path).map_err(|e| format!("打开文件失败: {e}"))?;
                 std::io::copy(&mut f, zip).map_err(|e| format!("复制文件内容到 zip 失败: {e}"))?;
             }
+            // 其余类型（FIFO / socket / 设备文件）跳过：读取它们可能阻塞或产生副作用。
         }
         Ok(())
     }
 
-    add_dir(&mut zip, dir, dir, &options)?;
-    let cursor = zip.finish().map_err(|e| format!("完成 zip 失败: {e}"))?;
-    Ok(cursor.into_inner().to_vec())
+    let mut visited = std::collections::HashSet::new();
+    add_dir(&mut zip, dir, dir, &options, &mut visited)?;
+
+    let mut writer = zip.finish().map_err(|e| format!("完成 zip 失败: {e}"))?;
+    use std::io::Write;
+    writer
+        .flush()
+        .map_err(|e| format!("刷新 zip 失败: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1708,7 +1826,7 @@ mod tests {
         };
 
         // 默认保险箱先初始化密码（后续删除保护需在解锁态验证）
-        vm.set_password("DefaultPass123!", false, false).unwrap();
+        vm.set_password("DefaultPass123!", false).unwrap();
         vm.lock();
 
         // 初始保险箱列表包含默认保险箱
@@ -1718,7 +1836,7 @@ mod tests {
         assert_eq!(list[0].name, "默认保险箱");
 
         // 创建新保险箱 "工作保险箱"
-        let create_res = vm.create_vault("工作保险箱", "WorkPass123!", false, false).unwrap();
+        let create_res = vm.create_vault("工作保险箱", "WorkPass123!", false).unwrap();
         assert_eq!(create_res.vault.name, "工作保险箱");
         assert_eq!(vm.current_vault_name, "工作保险箱");
         assert!(vm.is_unlocked);
@@ -1741,7 +1859,7 @@ mod tests {
 
         // 删除前需处于解锁态：切回待删除的保险箱并解锁
         vm.switch_vault(&current_id).unwrap();
-        vm.unlock("WorkPass123!", false, false).unwrap();
+        vm.unlock("WorkPass123!", false).unwrap();
 
         // 删除刚创建的工作保险箱
         let after_delete = vm.delete_vault(&current_id).unwrap();
@@ -1750,21 +1868,21 @@ mod tests {
         assert_eq!(list3.len(), 1);
 
         // 仅剩一个保险箱时，尝试删除应该报错保护
-        vm.unlock("DefaultPass123!", false, false).unwrap();
+        vm.unlock("DefaultPass123!", false).unwrap();
         assert!(vm.delete_vault("default").is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_secure_shred_file() {
+    fn test_best_effort_erase_file() {
         let temp_dir = std::env::temp_dir().join(format!("filelocker_shred_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
         let target = temp_dir.join("sensitive_secret.txt");
         fs::write(&target, b"Confidential plain text!").unwrap();
         assert!(target.exists());
 
-        secure_shred_file(&target).unwrap();
+        best_effort_erase_file(&target).unwrap();
         assert!(!target.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1798,21 +1916,21 @@ mod tests {
             last_activity: Cell::new(Utc::now().timestamp()),
         };
 
-        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.set_password("CorrectPassword123!", false).unwrap();
         vm.lock();
 
         // 连续输错 3 次
-        assert!(vm.unlock("wrong1", false, false).is_err());
+        assert!(vm.unlock("wrong1", false).is_err());
         assert_eq!(vm.failed_attempts, 1);
-        assert!(vm.unlock("wrong2", false, false).is_err());
+        assert!(vm.unlock("wrong2", false).is_err());
         assert_eq!(vm.failed_attempts, 2);
-        let err3 = vm.unlock("wrong3", false, false).unwrap_err();
+        let err3 = vm.unlock("wrong3", false).unwrap_err();
         assert_eq!(vm.failed_attempts, 3);
         assert!(err3.contains("安全保护触发"));
         assert!(vm.lockout_until.is_some());
 
         // 此时即使输入正确密码，也处于安全冷却中，被安全阻断
-        let blocked = vm.unlock("CorrectPassword123!", false, false).unwrap_err();
+        let blocked = vm.unlock("CorrectPassword123!", false).unwrap_err();
         assert!(blocked.contains("安全保护中"));
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1847,7 +1965,7 @@ mod tests {
             last_activity: Cell::new(Utc::now().timestamp()),
         };
 
-        let recovery_code = vm.set_password("OldPassword123!", false, false).unwrap();
+        let recovery_code = vm.set_password("OldPassword123!", false).unwrap();
         let mk = vm.master_key.unwrap();
 
         // 伪造一个使用 100,000 次迭代的旧版 keyring（不记录 recovery_iterations）
@@ -1873,7 +1991,7 @@ mod tests {
 
         // 解锁成功后应单向升级到 600,000，且绝不降到 100,000
         vm.lock();
-        vm.unlock("OldPassword123!", false, false).unwrap();
+        vm.unlock("OldPassword123!", false).unwrap();
         let upgraded: Keyring =
             serde_json::from_slice(&fs::read(vm.keyring_path()).unwrap()).unwrap();
         assert_eq!(upgraded.version, KEYRING_VERSION);
@@ -1894,24 +2012,24 @@ mod tests {
     fn test_guard_state_persists_across_restart() {
         let base = tmp_base("guard");
         let mut vm = make_test_vm(&base, "vault-a");
-        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.set_password("CorrectPassword123!", false).unwrap();
         vm.lock();
 
         for _ in 0..3 {
-            assert!(vm.unlock("wrong", false, false).is_err());
+            assert!(vm.unlock("wrong", false).is_err());
         }
         assert!(vm.lockout_until.is_some());
 
         // 模拟重启：新实例从 security.json 恢复冷却，无法通过重启绕过
         let mut restarted = make_test_vm(&base, "vault-a");
         let err = restarted
-            .unlock("CorrectPassword123!", false, false)
+            .unlock("CorrectPassword123!", false)
             .unwrap_err();
         assert!(err.contains("安全保护中"), "实际错误: {err}");
 
         // 冷却按保险箱隔离：另一个保险箱不应受牵连
         let mut other = make_test_vm(&base, "vault-b");
-        let other_err = other.unlock("CorrectPassword123!", false, false).unwrap_err();
+        let other_err = other.unlock("CorrectPassword123!", false).unwrap_err();
         assert!(!other_err.contains("安全保护中"), "实际错误: {other_err}");
 
         let _ = fs::remove_dir_all(&base);
@@ -1921,7 +2039,7 @@ mod tests {
     fn test_recovery_rate_limiting() {
         let base = tmp_base("recovery_guard");
         let mut vm = make_test_vm(&base, "vault-a");
-        let recovery_code = vm.set_password("CorrectPassword123!", false, false).unwrap();
+        let recovery_code = vm.set_password("CorrectPassword123!", false).unwrap();
         vm.lock();
 
         for _ in 0..2 {
@@ -1947,7 +2065,7 @@ mod tests {
     fn test_destructive_ops_require_unlock() {
         let base = tmp_base("destructive_guard");
         let mut vm = make_test_vm(&base, "vault-a");
-        vm.set_password("CorrectPassword123!", false, false).unwrap();
+        vm.set_password("CorrectPassword123!", false).unwrap();
         vm.lock();
 
         assert!(vm.reset_vault().unwrap_err().contains("尚未解锁"));
@@ -1969,20 +2087,20 @@ mod tests {
         let base = tmp_base("pwd_policy");
         let mut vm = make_test_vm(&base, "vault-a");
 
-        assert!(vm.set_password("short", false, false).unwrap_err().contains("至少"));
+        assert!(vm.set_password("short", false).unwrap_err().contains("至少"));
         assert!(vm
-            .set_password("12345678", false, false)
+            .set_password("12345678", false)
             .unwrap_err()
             .contains("过于简单"));
         assert!(vm
-            .set_password("83920174", false, false)
+            .set_password("83920174", false)
             .unwrap_err()
             .contains("纯数字"));
         assert!(vm
-            .set_password("aaaaaaaa", false, false)
+            .set_password("aaaaaaaa", false)
             .unwrap_err()
             .contains("相同字符"));
-        assert!(vm.set_password("StrongPass123!", false, false).is_ok());
+        assert!(vm.set_password("StrongPass123!", false).is_ok());
 
         let _ = fs::remove_dir_all(&base);
     }

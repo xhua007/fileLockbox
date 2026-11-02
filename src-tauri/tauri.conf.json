@@ -39,7 +39,7 @@
       "icons/icon.png"
     ],
     "shortDescription": "本地文件保险箱",
-    "longDescription": "文件保险箱 - 使用 AES-256-GCM 加密本地文件，支持 Touch ID 和恢复码",
+    "longDescription": "文件保险箱 - 使用 AES-256-GCM 加密本地文件，支持系统钥匙串记住密码和恢复码",
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.15"

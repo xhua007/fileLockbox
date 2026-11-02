@@ -191,7 +191,7 @@ async function switchVault(vaultId) {
     if (info.exists) {
       if (info.has_saved_password) {
         try {
-          const entries = await invoke('biometric_unlock');
+          const entries = await invoke('unlock_with_keychain');
           state.entries = entries;
           if (state.currentVault) state.currentVault.is_unlocked = true;
           showToast(`已切换至「${info.name}」并自动解锁`);
@@ -308,7 +308,7 @@ function renderSetup() {
     submitting = true;
     btn.disabled = true; btn.textContent = '创建中…';
     try {
-      const code = await invoke('setup_password', { password: p1, remember: rem, useBiometry: rem });
+      const code = await invoke('setup_password', { password: p1, remember: rem });
       state.pendingRecoveryCode = code;
       state.entries = [];
       state.hasSavedPassword = rem;
@@ -399,7 +399,7 @@ function renderUnlock() {
     unlockBtn.disabled = true;
     unlockBtn.textContent = '正在解锁…';
     try {
-      const entries = await invoke('unlock', { password: p, remember: rememberCb.checked, useBiometry: false });
+      const entries = await invoke('unlock', { password: p, remember: rememberCb.checked });
       state.entries = entries;
       state.hasSavedPassword = rememberCb.checked;
       if (state.currentVault) state.currentVault.is_unlocked = true;
@@ -421,27 +421,27 @@ function renderUnlock() {
     }
   };
 
-  const bioBtn = el('button', {
+  const keychainBtn = el('button', {
     class: 'btn bio-btn',
-    onclick: () => doBiometricUnlock()
+    onclick: () => doKeychainUnlock()
   }, '⚡️ 使用已记住的密码解锁');
 
-  const doBiometricUnlock = async () => {
+  const doKeychainUnlock = async () => {
     if (unlocking || state.lockoutRemaining > 0) return;
     unlocking = true;
     errDiv.textContent = '';
-    bioBtn.disabled = true;
-    bioBtn.textContent = '正在解锁…';
+    keychainBtn.disabled = true;
+    keychainBtn.textContent = '正在解锁…';
     try {
-      const entries = await invoke('biometric_unlock');
+      const entries = await invoke('unlock_with_keychain');
       state.entries = entries;
       if (state.currentVault) state.currentVault.is_unlocked = true;
       enterMain();
     } catch (e) {
       const errStr = String(e || '解锁失败，请输入密码');
       errDiv.textContent = errStr;
-      bioBtn.disabled = false;
-      bioBtn.textContent = '⚡️ 使用已记住的密码解锁';
+      keychainBtn.disabled = false;
+      keychainBtn.textContent = '⚡️ 使用已记住的密码解锁';
       unlocking = false;
 
       const match = errStr.match(/请等待\s*(\d+)\s*秒/);
@@ -471,7 +471,7 @@ function renderUnlock() {
   if (state.hasSavedPassword) {
     card.append(
       el('div', { class: 'auth-divider' }, el('span', {}, '或')),
-      bioBtn
+      keychainBtn
     );
   }
   card.append(el('button', { class: 'link-btn', onclick: goRecovery }, '忘记密码？用恢复码找回'));
@@ -962,12 +962,12 @@ async function restoreEntry(id) {
 }
 
 async function deleteEntry(entry) {
-  showConfirm(`确定要安全粉碎删除「${entry.name}」吗？密文将被 0 字节覆写销毁，不可恢复。`, async () => {
+  showConfirm(`确定要删除「${entry.name}」吗？密文文件会从保险箱中移除，删除后不可恢复。`, async () => {
     try {
       await invoke('delete_entry', { id: entry.id });
       state.entries = await invoke('list_entries');
       state.selectedIds.delete(entry.id);
-      showToast('已彻底粉碎删除');
+      showToast('已删除，密文文件已移除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -976,13 +976,13 @@ async function deleteEntry(entry) {
 async function deleteSelected() {
   const ids = Array.from(state.selectedIds);
   if (ids.length === 0) return;
-  showConfirm(`确定要彻底粉碎删除选中的 ${ids.length} 项吗？密文将被 0 字节覆写销毁，不可恢复。`, async () => {
+  showConfirm(`确定要删除选中的 ${ids.length} 项吗？密文文件会从保险箱中移除，删除后不可恢复。`, async () => {
     try {
       await invoke('delete_entries', { ids });
       state.entries = await invoke('list_entries');
       state.selectedIds.clear();
       state.multiSelectMode = false;
-      showToast('已彻底粉碎删除');
+      showToast('已删除，密文文件已移除');
       render();
     } catch (e) { showError('删除失败: ' + e); }
   });
@@ -1163,8 +1163,8 @@ document.addEventListener('click', e => {
       (async () => {
         try {
           await invoke('clear_temp');
-          showToast('已安全粉碎所有临时预览文件');
-        } catch (err) { showError('粉碎失败: ' + err); }
+          showToast('已清理所有临时预览文件');
+        } catch (err) { showError('清理失败: ' + err); }
       })();
     }
     else if (action === 'forget-pw') {
@@ -1285,8 +1285,7 @@ function showCreateVaultModal() {
       const res = await invoke('create_vault', {
         name,
         password: p1,
-        remember: rem,
-        useBiometry: rem
+        remember: rem
       });
       state.currentVault = res.vault;
       state.pendingRecoveryCode = res.recovery_code;
@@ -1496,7 +1495,7 @@ function showChangePasswordModal() {
 
 function showResetConfirm() {
   const vaultName = state.currentVault ? state.currentVault.name : '当前保险箱';
-  showConfirm(`确定要清空「${vaultName}」吗？该保险箱内的所有加密文件将被永久粉碎删除，此操作不可恢复！`, async () => {
+  showConfirm(`确定要清空「${vaultName}」吗？该保险箱内的所有加密文件将被删除，此操作不可恢复！`, async () => {
     try {
       await invoke('reset_vault');
       state.entries = [];
@@ -1519,7 +1518,7 @@ async function init() {
       state.hasSavedPassword = await invoke('has_saved_password');
       if (state.hasSavedPassword) {
         try {
-          const entries = await invoke('biometric_unlock');
+          const entries = await invoke('unlock_with_keychain');
           state.entries = entries;
           if (state.currentVault) state.currentVault.is_unlocked = true;
           state.autoLockMinutes = await invoke('get_auto_lock_minutes');

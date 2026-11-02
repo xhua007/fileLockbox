@@ -2,6 +2,7 @@ use keyring::Entry;
 
 const DEFAULT_SERVICE: &str = "com.filelocker.vault";
 const ACCOUNT: &str = "password";
+const GENERATION_ACCOUNT: &str = "index-generation";
 
 fn service_for_vault(vault_id: &str) -> String {
     if vault_id == "default" || vault_id.is_empty() {
@@ -16,7 +17,11 @@ fn entry(vault_id: &str) -> Result<Entry, String> {
     Entry::new(&service, ACCOUNT).map_err(|e| format!("钥匙串访问失败: {e}"))
 }
 
-pub fn save_password(vault_id: &str, pwd: &str, _use_biometry: bool) -> Result<(), String> {
+/// 将主密码写入系统钥匙串。
+///
+/// 说明：这里只是「操作系统凭据存储」，**不包含生物识别门控**。
+/// 是否能免密读取取决于系统对钥匙串访问控制的设置，应用本身不再做指纹/Face ID 校验。
+pub fn save_password(vault_id: &str, pwd: &str) -> Result<(), String> {
     let en = entry(vault_id)?;
     let _ = en.delete_password();
     en.set_password(pwd)
@@ -41,4 +46,32 @@ pub fn has_saved_password(vault_id: &str) -> bool {
         Ok(en) => en.get_password().is_ok(),
         Err(_) => false,
     }
+}
+
+fn generation_entry(vault_id: &str) -> Result<Entry, String> {
+    let service = service_for_vault(vault_id);
+    Entry::new(&service, GENERATION_ACCOUNT).map_err(|e| format!("钥匙串访问失败: {e}"))
+}
+
+/// 读取索引代次锚点。锚点存放在应用数据目录之外，用于识别「旧索引被替换回来」。
+pub fn load_index_generation(vault_id: &str) -> Result<u64, String> {
+    let en = generation_entry(vault_id)?;
+    let raw = en
+        .get_password()
+        .map_err(|e| format!("读取索引代次失败: {e}"))?;
+    raw.parse::<u64>()
+        .map_err(|e| format!("索引代次格式无效: {e}"))
+}
+
+pub fn store_index_generation(vault_id: &str, generation: u64) -> Result<(), String> {
+    let en = generation_entry(vault_id)?;
+    en.set_password(&generation.to_string())
+        .map_err(|e| format!("保存索引代次失败: {e}"))
+}
+
+pub fn delete_index_generation(vault_id: &str) -> Result<(), String> {
+    if let Ok(en) = generation_entry(vault_id) {
+        let _ = en.delete_password();
+    }
+    Ok(())
 }

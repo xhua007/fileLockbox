@@ -25,22 +25,20 @@ fn vault_exists(state: State<VaultState>) -> bool {
 fn setup_password(
     password: String,
     remember: bool,
-    use_biometry: bool,
     state: State<VaultState>,
 ) -> Result<String, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.set_password(&password, remember, use_biometry)
+    v.set_password(&password, remember)
 }
 
 #[tauri::command]
 fn unlock(
     password: String,
     remember: bool,
-    use_biometry: bool,
     state: State<VaultState>,
 ) -> Result<Vec<VaultEntry>, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.unlock(&password, remember, use_biometry)
+    v.unlock(&password, remember)
 }
 
 #[tauri::command]
@@ -68,10 +66,11 @@ fn has_saved_password(state: State<VaultState>) -> bool {
     state.lock().map(|v| v.has_saved_password()).unwrap_or(false)
 }
 
+/// 使用系统钥匙串中已记住的密码解锁（非生物识别）。
 #[tauri::command]
-fn biometric_unlock(state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
+fn unlock_with_keychain(state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.biometric_unlock()
+    v.unlock_with_keychain()
 }
 
 #[tauri::command]
@@ -221,11 +220,10 @@ fn create_vault(
     name: String,
     password: String,
     remember: bool,
-    use_biometry: bool,
     state: State<VaultState>,
 ) -> Result<CreateVaultResult, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.create_vault(&name, &password, remember, use_biometry)
+    v.create_vault(&name, &password, remember)
 }
 
 #[tauri::command]
@@ -358,7 +356,7 @@ pub fn run() {
             touch_activity,
             is_unlocked,
             has_saved_password,
-            biometric_unlock,
+            unlock_with_keychain,
             list_entries,
             rename_entry,
             add_files,
