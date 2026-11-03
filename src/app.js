@@ -1526,9 +1526,8 @@ async function init() {
   render();
   try {
     await loadVaultsInfo();
-    const exists = await invoke('vault_exists');
+    const exists = state.currentVault ? state.currentVault.exists : await invoke('vault_exists');
     if (exists) {
-      state.hasSavedPassword = await invoke('has_saved_password');
       if (state.hasSavedPassword) {
         try {
           const entries = await invoke('unlock_with_keychain');

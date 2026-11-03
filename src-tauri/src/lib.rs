@@ -69,6 +69,7 @@ fn has_saved_password(state: State<VaultState>) -> bool {
 /// 使用系统钥匙串中已记住的密码解锁（非生物识别）。
 #[tauri::command]
 fn unlock_with_keychain(state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
+    keychain::reset_keychain_denied();
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.unlock_with_keychain()
 }

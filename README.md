@@ -189,7 +189,7 @@ com.filelocker.FileLocker/
     └── tmp/             # 临时解密目录（锁定/退出时清空）
 ```
 
-## 持续集成
+## 持续集成与发布
 
 [.github/workflows/build.yml](.github/workflows/build.yml) 会在推送 `v*` 标签或手动触发时运行：
 
@@ -202,3 +202,12 @@ git push origin v1.0.0
 ```
 
 构建产物以 artifact 形式上传到对应的工作流运行记录中。
+
+## 版本升级与向后兼容规范
+
+为确保跨版本更新时用户的历史加密数据永不丢失或损坏，所有后续开发与重构必须严格遵守：
+👉 **[版本升级与向后兼容设计规范 (COMPATIBILITY_RULES.md)](COMPATIBILITY_RULES.md)**
+- 数据魔数与元数据自报家门
+- 密码学参数自适应读取与单向静默升级
+- 启动期自动数据迁移管道
+- CI 历史样本回归测试保障

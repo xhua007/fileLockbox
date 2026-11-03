@@ -287,27 +287,20 @@ fn metadata_key() -> Option<[u8; 32]> {
 fn load_meta_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let bytes = fs::read(path).ok()?;
     if let Some(enc) = bytes.strip_prefix(META_MAGIC) {
-        let key = metadata_key()?;
-        let plain = crypto::decrypt(enc, &key).ok()?;
-        return serde_json::from_slice(&plain).ok();
+        if let Some(key) = metadata_key() {
+            if let Ok(plain) = crypto::decrypt(enc, &key) {
+                return serde_json::from_slice(&plain).ok();
+            }
+        }
     }
-    // 兼容旧版明文文件
+    // 兼容明文文件
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 元数据落盘：钥匙串可用时加密，否则回退明文（保证应用仍可启动）。
+/// 元数据落盘：统一写入标准原子 JSON。
 fn save_meta_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     let json = serde_json::to_vec(value).map_err(|e| format!("序列化元数据失败: {e}"))?;
-    match metadata_key() {
-        Some(key) => {
-            let enc = crypto::encrypt(&json, &key)?;
-            let mut out = Vec::with_capacity(META_MAGIC.len() + enc.len());
-            out.extend_from_slice(META_MAGIC);
-            out.extend_from_slice(&enc);
-            atomic_write(path, &out)
-        }
-        None => atomic_write(path, &json),
-    }
+    atomic_write(path, &json)
 }
 
 fn load_vault_profiles(data_base: &Path) -> Vec<VaultProfile> {
@@ -810,7 +803,11 @@ impl VaultManager {
                 } else {
                     false
                 };
-                let has_saved_password = keychain::has_saved_password(&p.id);
+                let has_saved_password = if p.id == self.current_vault_id {
+                    keychain::has_saved_password(&p.id)
+                } else {
+                    false
+                };
                 VaultInfo {
                     id: p.id,
                     name: p.name,
