@@ -24,18 +24,18 @@
 
 ## 安全设计
 
-| 项目 | 实现 |
-| --- | --- |
-| 文件加密 | AES-256-GCM，流式 2MB 分块加密（独立 Nonce、结尾防篡改标记）+ 历史单 blob 自动识别 |
-| 密钥派生 | PBKDF2-HMAC-SHA256，600,000 次迭代（旧版 100,000 次自动升级），16 字节随机盐 |
-| 主密钥 | 运行时随机生成 256 位，不直接落盘 |
-| 密码包装 | 密码派生 KEK 后 AES-GCM 包装主密钥（`keyring.json`，原子写入） |
-| 恢复码包装 | 独立盐派生 KEK 包装主密钥，与密码互不相关 |
-| 索引与备份 | 整个条目列表 JSON 使用主密钥加密，采用原子落盘并自动保留 `index.enc.bak` 容灾 |
-| 内存安全 | 锁定时对主密钥与临时派生 KEK 进行零化擦除 (Zeroize) |
-| 多保险箱隔离 | 钥匙串服务独立命名（`com.filelocker.vault.<id>`），默认保险箱保留原有命名保持兼容 |
-| 恢复码格式 | 24 字符 Crockford Base32，形如 `ABCD-EFGH-JKLM-NPQR-STVW-XYZA`，输入时自动纠正常见混淆字符 |
-| 临时文件 | 启动 / 退出 / 锁定时自动清空临时解密目录 |
+| 项目         | 实现                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------ |
+| 文件加密     | AES-256-GCM，流式 2MB 分块加密（独立 Nonce、结尾防篡改标记）+ 历史单 blob 自动识别         |
+| 密钥派生     | PBKDF2-HMAC-SHA256，600,000 次迭代（旧版 100,000 次自动升级），16 字节随机盐               |
+| 主密钥       | 运行时随机生成 256 位，不直接落盘                                                          |
+| 密码包装     | 密码派生 KEK 后 AES-GCM 包装主密钥（`keyring.json`，原子写入）                             |
+| 恢复码包装   | 独立盐派生 KEK 包装主密钥，与密码互不相关                                                  |
+| 索引与备份   | 整个条目列表 JSON 使用主密钥加密，采用原子落盘并自动保留 `index.enc.bak` 容灾              |
+| 内存安全     | 锁定时对主密钥与临时派生 KEK 进行零化擦除 (Zeroize)                                        |
+| 多保险箱隔离 | 钥匙串服务独立命名（`com.filelocker.vault.<id>`），默认保险箱保留原有命名保持兼容          |
+| 恢复码格式   | 24 字符 Crockford Base32，形如 `ABCD-EFGH-JKLM-NPQR-STVW-XYZA`，输入时自动纠正常见混淆字符 |
+| 临时文件     | 启动 / 退出 / 锁定时自动清空临时解密目录                                                   |
 
 > 本项目为个人项目，尚未经过第三方安全审计。请务必离线备份恢复码；恢复码遗失且忘记密码时，数据无法找回。
 
@@ -103,27 +103,73 @@ npm run dev
 cd src-tauri && cargo test
 ```
 
-### 5. 打包与发布
+### 5. 本地打包与自用安装指南
 
-#### 方式 A：标准跨平台打包
+#### 打包前准备（可选但建议）
+
+如果近期有大范围代码修改或出现过 LLVM 增量缓存报错，建议先清理一次旧缓存以保证构建纯净：
+
+```bash
+cd src-tauri && cargo clean && cd ..
+```
+
+---
+
+#### 方式一：快速构建并直接安装到本机（推荐个人使用）
+
+若仅供本机日常使用，无需经历磁盘映像制作过程，直接构建原生 `.app` 最为迅速：
+
+1. **编译原生 App 产物**：
+   ```bash
+   npx tauri build --bundles app
+   ```
+2. **安装到 macOS 系统的「应用程序」**：
+   ```bash
+   cp -R src-tauri/target/release/bundle/macos/FileLocker.app /Applications/
+   ```
+   _也可以在终端运行 `open src-tauri/target/release/bundle/macos`，直接在访达窗口中将 `FileLocker.app` 拖入左侧边栏的「应用程序」文件夹。_
+
+---
+
+#### 方式二：标准 DMG 安装镜像打包（跨平台标准方式）
+
+生成带图形拖拽安装界面的 `.dmg` 文件：
 
 ```bash
 npm run build
 ```
 
-打包产物输出路径：
-- **macOS**：`src-tauri/target/release/bundle/dmg/*.dmg` 及 `bundle/macos/FileLocker.app`
-- **Windows**：`src-tauri/target/release/bundle/msi/*.msi` 及 `bundle/nsis/*.exe`
+打包完成后产物输出位置：
 
-#### 方式 B：一键打包 macOS 通用版 DMG（arm64 + x86_64）
+- **macOS**：
+  - DMG 安装包：`src-tauri/target/release/bundle/dmg/FileLocker_1.0.0_aarch64.dmg`（Apple Silicon）或相应架构包
+  - App 应用程序：`src-tauri/target/release/bundle/macos/FileLocker.app`
+- **Windows**：
+  - MSI 安装包：`src-tauri/target/release/bundle/msi/*.msi`
+  - NSIS 安装程序：`src-tauri/target/release/bundle/nsis/*.exe`
 
-适合直接在 macOS 上分发，支持 Intel 与 Apple Silicon 双架构：
+---
+
+#### 方式三：打包 macOS 通用版 DMG（Universal，同时支持 M 系列与 Intel）
+
+适合分发给其他不同芯片架构的 Mac 电脑使用：
 
 ```bash
 ./scripts/build_dmg_tauri.sh
 ```
 
-- 输出产物位于：`build-tauri/FileLocker-macOS-universal.dmg`（含 Applications 替身，可直接双击安装）。
+- 输出产物位于：`build-tauri/FileLocker-macOS-universal.dmg`（内置 Applications 替身快捷方式，双击即可拖入安装）。
+
+---
+
+#### ⚠️ 首次启动注意说明（macOS Gatekeeper 安全提示）
+
+由于个人本地编译的应用未购买苹果年费开发者证书（采用本地签名），macOS 首次打开时可能会提示 **“无法打开，因为无法验证开发者”**。只需任选以下一种方式授权一次即可：
+
+- **方式 A（最快捷）**：在访达「应用程序」中找到 **FileLocker**，**按住 Control 键并点击它（或右键）-> 选择「打开」-> 在弹出的确认弹窗中点击「打开」**；
+- **方式 B**：打开 Mac **「系统设置」->「隐私与安全性」**，向下滑动找到 _已阻止使用 FileLocker_，点击其右侧的 **「仍要打开」**。
+
+_首次授权后，即可在 Launchpad、Spotlight 或程序坞中正常双击秒开。_
 
 ## 数据存储位置
 
