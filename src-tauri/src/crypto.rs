@@ -370,7 +370,20 @@ fn ensure_stream_end<R: Read>(reader: &mut R) -> Result<(), String> {
 /// 写出 v2 格式：每块的 AAD 绑定块大小、分块序号与结束标记，任何重排/截断/改写都会认证失败。
 /// 失败时删除已写出的半成品文件，避免残留不完整密文。
 pub fn encrypt_file_stream(src: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
-    match encrypt_file_stream_inner(src, dst, key) {
+    encrypt_file_stream_with_progress(src, dst, key, |_, _| {})
+}
+
+/// 支持实时进度回调的流式加密，回调参数为 (当前已处理字节, 源文件总字节数)。
+pub fn encrypt_file_stream_with_progress<F>(
+    src: &Path,
+    dst: &Path,
+    key: &[u8; KEY_LEN],
+    on_progress: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
+    match encrypt_file_stream_inner(src, dst, key, on_progress) {
         Ok(n) => Ok(n),
         Err(e) => {
             let _ = std::fs::remove_file(dst);
@@ -379,8 +392,17 @@ pub fn encrypt_file_stream(src: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Resul
     }
 }
 
-fn encrypt_file_stream_inner(src: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
+fn encrypt_file_stream_inner<F>(
+    src: &Path,
+    dst: &Path,
+    key: &[u8; KEY_LEN],
+    mut on_progress: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
     let mut reader = File::open(src).map_err(|e| format!("打开源文件失败: {e}"))?;
+    let total_src_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
     let mut writer = File::create(dst).map_err(|e| format!("创建目标密文文件失败: {e}"))?;
 
     let chunk_size = DEFAULT_CHUNK_SIZE;
@@ -448,6 +470,7 @@ fn encrypt_file_stream_inner(src: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Res
 
         total_plain_bytes += plain_len as u64;
         chunk_index += 1;
+        on_progress(total_plain_bytes, total_src_len);
 
         if is_last {
             break;
@@ -477,7 +500,20 @@ fn parse_chunk_header(header: &[u8; 16], file_len: u64) -> Result<(bool, usize),
 /// 超大文件流式解密：将 cipher_path 解密流式写入 dst。自动兼容 v2/v1 分块流与历史老版单 blob 格式。
 /// 失败时删除已写出的半成品文件，避免残留不完整明文。
 pub fn decrypt_file_stream(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
-    match decrypt_file_stream_inner(cipher_path, dst, key) {
+    decrypt_file_stream_with_progress(cipher_path, dst, key, |_, _| {})
+}
+
+/// 支持实时进度回调的流式解密，回调参数为 (已解密字节数, 密文总字节数)。
+pub fn decrypt_file_stream_with_progress<F>(
+    cipher_path: &Path,
+    dst: &Path,
+    key: &[u8; KEY_LEN],
+    on_progress: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
+    match decrypt_file_stream_inner(cipher_path, dst, key, on_progress) {
         Ok(n) => Ok(n),
         Err(e) => {
             let _ = std::fs::remove_file(dst);
@@ -486,7 +522,15 @@ pub fn decrypt_file_stream(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]) 
     }
 }
 
-fn decrypt_file_stream_inner(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
+fn decrypt_file_stream_inner<F>(
+    cipher_path: &Path,
+    dst: &Path,
+    key: &[u8; KEY_LEN],
+    mut on_progress: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
     let mut reader = File::open(cipher_path).map_err(|e| format!("打开密文文件失败: {e}"))?;
     let mut writer = File::create(dst).map_err(|e| format!("创建目标解密文件失败: {e}"))?;
 
@@ -525,6 +569,8 @@ fn decrypt_file_stream_inner(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]
                     .map_err(|e| format!("写入解密文件失败: {e}"))?;
 
                 chunk_index += 1;
+                on_progress(total_plain_bytes, file_len);
+
                 if chunk.is_last {
                     break;
                 }
@@ -543,6 +589,7 @@ fn decrypt_file_stream_inner(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]
     let plain = decrypt(&cipher_all, key)?;
     writer.write_all(&plain).map_err(|e| format!("写入解密文件失败: {e}"))?;
     writer.flush().map_err(|e| format!("刷新解密文件失败: {e}"))?;
+    on_progress(plain.len() as u64, file_len);
     Ok(plain.len() as u64)
 }
 
@@ -820,5 +867,42 @@ mod tests {
 
         let cloned = protected.clone();
         assert_eq!(*cloned, raw);
+    }
+
+    #[test]
+    fn test_stream_encryption_progress() {
+        let key = [9u8; KEY_LEN];
+        let plain = vec![0x33u8; DEFAULT_CHUNK_SIZE + 1024];
+        let src = temp_path("progress_src.bin");
+        let enc = temp_path("progress.enc");
+        let dec = temp_path("progress.dec");
+        std::fs::write(&src, &plain).unwrap();
+
+        let mut enc_updates = 0;
+        let mut enc_last_bytes = 0;
+        let n = encrypt_file_stream_with_progress(&src, &enc, &key, |done, total| {
+            enc_updates += 1;
+            enc_last_bytes = done;
+            assert_eq!(total, plain.len() as u64);
+        })
+        .unwrap();
+        assert_eq!(n, plain.len() as u64);
+        assert_eq!(enc_last_bytes, plain.len() as u64);
+        assert!(enc_updates >= 2);
+
+        let mut dec_updates = 0;
+        let mut dec_last_bytes = 0;
+        let m = decrypt_file_stream_with_progress(&enc, &dec, &key, |done, _total| {
+            dec_updates += 1;
+            dec_last_bytes = done;
+        })
+        .unwrap();
+        assert_eq!(m, plain.len() as u64);
+        assert_eq!(dec_last_bytes, plain.len() as u64);
+        assert!(dec_updates >= 2);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&enc);
+        let _ = std::fs::remove_file(&dec);
     }
 }

@@ -306,6 +306,47 @@ async function initAutoLockListener() {
     });
   } catch {}
 }
+
+let progressDismissTimer = null;
+function handleOperationProgress(p) {
+  const card = $('#operationProgressCard');
+  if (!card) return;
+  if (p.is_finished) {
+    $('#progressToastBadge').textContent = '100%';
+    $('#progressToastFill').style.width = '100%';
+    $('#progressToastIcon').textContent = '✅';
+    $('#progressToastTitle').textContent = p.stage === 'export' ? '导出完成' : '加密完成';
+    $('#progressToastFile').textContent = `共 ${p.total_files} 个文件处理完毕`;
+    clearTimeout(progressDismissTimer);
+    progressDismissTimer = setTimeout(() => {
+      card.classList.add('hidden');
+    }, 1500);
+    return;
+  }
+
+  clearTimeout(progressDismissTimer);
+  card.classList.remove('hidden');
+  const isExport = p.stage === 'export';
+  $('#progressToastIcon').textContent = isExport ? '⤴' : '⚡';
+  $('#progressToastTitle').textContent = isExport
+    ? `正在导出 (${p.current_file}/${p.total_files})`
+    : `正在并发加密 (${p.current_file}/${p.total_files})`;
+  const pct = Math.min(100, Math.max(0, Math.round(p.percent)));
+  $('#progressToastBadge').textContent = `${pct}%`;
+  $('#progressToastFill').style.width = `${pct}%`;
+  $('#progressToastFile').textContent = p.file_name || '处理中…';
+  $('#progressToastBytes').textContent = `${formatSize(p.processed_bytes)} / ${formatSize(p.total_bytes)}`;
+}
+
+async function initOperationProgressListener() {
+  try {
+    await listen('vault-operation-progress', event => {
+      if (event && event.payload) {
+        handleOperationProgress(event.payload);
+      }
+    });
+  } catch {}
+}
 function startIdleMonitor() {
   if (state.idleTimer) clearInterval(state.idleTimer);
   state.idleTimer = setInterval(() => {
@@ -681,11 +722,15 @@ function renderMain() {
     type: 'text', class: 'search-input',
     placeholder: '搜索文件…', value: state.searchQuery
   });
+  let searchTimer = null;
   searchInput.addEventListener('input', e => {
     state.searchQuery = e.target.value;
-    const list = $('#listContainer');
-    if (list) renderListInto(list);
-    updateCountLabel();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      const list = $('#listContainer');
+      if (list) renderListInto(list);
+      updateCountLabel();
+    }, 120);
   });
   const center = el('div', { class: 'topbar-center' }, [
     el('div', { class: 'search-box' }, [
@@ -806,6 +851,9 @@ function applyFilterAndSort() {
   state.filteredEntries = list;
 }
 
+const VIRTUAL_ROW_HEIGHT = 56;
+const VIRTUAL_BUFFER = 6;
+
 function renderListInto(container) {
   container.innerHTML = '';
   applyFilterAndSort();
@@ -835,9 +883,53 @@ function renderListInto(container) {
     ]));
     return;
   }
-  for (const entry of state.filteredEntries) {
-    container.appendChild(renderFileItem(entry));
+
+  // 小于等于 35 项直接渲染，极低开销
+  if (state.filteredEntries.length <= 35) {
+    container.onscroll = null;
+    for (const entry of state.filteredEntries) {
+      container.appendChild(renderFileItem(entry));
+    }
+    return;
   }
+
+  // 大数据量启用虚拟滚动（Virtual List），仅渲染当前可视区域的 DOM，支撑 10 万+ 条目流畅如丝
+  const totalItems = state.filteredEntries.length;
+  const totalHeight = totalItems * VIRTUAL_ROW_HEIGHT;
+
+  const spacer = el('div', {
+    class: 'virtual-spacer',
+    style: `height:${totalHeight}px;`
+  });
+  const windowLayer = el('div', {
+    class: 'virtual-content',
+    id: 'virtualWindowLayer'
+  });
+
+  container.append(spacer, windowLayer);
+
+  let lastStart = -1;
+  let lastEnd = -1;
+
+  const updateVirtualRows = () => {
+    const scrollTop = container.scrollTop;
+    const clientHeight = container.clientHeight || 500;
+    const start = Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_BUFFER);
+    const end = Math.min(totalItems, Math.ceil((scrollTop + clientHeight) / VIRTUAL_ROW_HEIGHT) + VIRTUAL_BUFFER);
+
+    if (start === lastStart && end === lastEnd) return;
+    lastStart = start;
+    lastEnd = end;
+
+    windowLayer.style.transform = `translateY(${start * VIRTUAL_ROW_HEIGHT}px)`;
+    windowLayer.innerHTML = '';
+    for (let i = start; i < end; i++) {
+      windowLayer.appendChild(renderFileItem(state.filteredEntries[i]));
+    }
+  };
+
+  container.onscroll = () => requestAnimationFrame(updateVirtualRows);
+  updateVirtualRows();
 }
 
 function renderFileItem(entry) {
@@ -1616,6 +1708,7 @@ async function init() {
           startIdleMonitor();
           initDragDropListener();
           initAutoLockListener();
+          initOperationProgressListener();
           return;
         } catch (e) {
           console.warn('记住密码自动解锁失败，展示手动解锁界面:', e);
@@ -1633,6 +1726,7 @@ async function init() {
   startIdleMonitor();
   initDragDropListener();
   initAutoLockListener();
+  initOperationProgressListener();
 }
 
 // Keyboard shortcuts

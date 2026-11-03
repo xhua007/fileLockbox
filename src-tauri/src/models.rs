@@ -92,3 +92,16 @@ pub struct CreateVaultResult {
     pub vault: VaultInfo,
     pub recovery_code: String,
 }
+
+/// 加密/解密/导出实时进度
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OperationProgress {
+    pub stage: String, // "encrypt" | "decrypt" | "export"
+    pub current_file: usize,
+    pub total_files: usize,
+    pub file_name: String,
+    pub processed_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: f32,
+    pub is_finished: bool,
+}

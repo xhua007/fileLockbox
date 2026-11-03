@@ -91,9 +91,31 @@ fn rename_entry(
 }
 
 #[tauri::command]
-fn add_files(paths: Vec<String>, state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
+fn add_files(
+    paths: Vec<String>,
+    app: tauri::AppHandle,
+    state: State<VaultState>,
+) -> Result<Vec<VaultEntry>, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.add_files(paths)
+    let total_files = paths.len();
+    let app_handle = app.clone();
+    let res = v.add_files_with_progress(paths, move |prog| {
+        let _ = app_handle.emit("vault-operation-progress", prog);
+    });
+    let _ = app.emit(
+        "vault-operation-progress",
+        crate::models::OperationProgress {
+            stage: "encrypt".to_string(),
+            current_file: total_files,
+            total_files,
+            file_name: "".to_string(),
+            processed_bytes: 0,
+            total_bytes: 0,
+            percent: 100.0,
+            is_finished: true,
+        },
+    );
+    res
 }
 
 #[tauri::command]
@@ -112,10 +134,29 @@ fn export_entry(id: String, target_path: String, state: State<VaultState>) -> Re
 fn export_entries_to_dir(
     ids: Vec<String>,
     dir: String,
+    app: tauri::AppHandle,
     state: State<VaultState>,
 ) -> Result<(), String> {
     let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
-    v.export_entries_to_dir(&ids, &dir)
+    let total_files = ids.len();
+    let app_handle = app.clone();
+    let res = v.export_entries_to_dir_with_progress(&ids, &dir, move |prog| {
+        let _ = app_handle.emit("vault-operation-progress", prog);
+    });
+    let _ = app.emit(
+        "vault-operation-progress",
+        crate::models::OperationProgress {
+            stage: "export".to_string(),
+            current_file: total_files,
+            total_files,
+            file_name: "".to_string(),
+            processed_bytes: 0,
+            total_bytes: 0,
+            percent: 100.0,
+            is_finished: true,
+        },
+    );
+    res
 }
 
 #[tauri::command]

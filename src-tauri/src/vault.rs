@@ -1048,12 +1048,24 @@ impl VaultManager {
 
     /// 添加文件/文件夹：支持超大文件流式分块加密，内存占用恒定 ~4MB，支持任意 GB 级大文件。
     pub fn add_files(&mut self, paths: Vec<String>) -> Result<Vec<VaultEntry>, String> {
+        self.add_files_with_progress(paths, |_| {})
+    }
+
+    /// 添加文件/文件夹：支持多核 CPU 并发流式分块加密与进度上报，内存占用恒定 ~4MB，支持任意 GB 级大文件。
+    pub fn add_files_with_progress<F>(
+        &mut self,
+        paths: Vec<String>,
+        mut on_progress: F,
+    ) -> Result<Vec<VaultEntry>, String>
+    where
+        F: FnMut(crate::models::OperationProgress) + Send + Sync,
+    {
         let mk = self.require_unlocked()?;
         create_private_dir(&self.data_dir).map_err(|e| format!("创建 data 目录失败: {e}"))?;
 
-        let existing = self.entries.clone();
-        let mut added: Vec<VaultEntry> = Vec::new();
+        let mut valid_paths: Vec<(String, PathBuf, String, bool)> = Vec::with_capacity(paths.len());
         let mut skipped = 0usize;
+        let tmp_canon = self.temp_dir.canonicalize().ok();
 
         for p_str in paths {
             let p = PathBuf::from(&p_str);
@@ -1062,9 +1074,9 @@ impl VaultManager {
             }
 
             // 从应用 tmp 目录拖入的文件（本应用临时解密出的副本）跳过。
-            if let Ok(tmp_canon) = self.temp_dir.canonicalize() {
+            if let Some(ref tc) = tmp_canon {
                 if let Ok(p_canon) = p.canonicalize() {
-                    if p_canon.starts_with(&tmp_canon) {
+                    if p_canon.starts_with(tc) {
                         skipped += 1;
                         continue;
                     }
@@ -1077,61 +1089,178 @@ impl VaultManager {
                 .to_string_lossy()
                 .to_string();
             let is_dir = p.is_dir();
+            valid_paths.push((p_str, p, name, is_dir));
+        }
 
-            let id = Uuid::new_v4().to_string();
-            let blob_name = format!("{}.bin", Uuid::new_v4());
-            let blob_path = self.data_dir.join(&blob_name);
+        if valid_paths.is_empty() {
+            return Ok(Vec::new());
+        }
 
-            let (kind, size) = if is_dir {
-                // 文件夹先打包成临时 zip，再流式加密：内存占用不再等于文件夹总大小。
-                // 临时 zip 中为明文，用完立即尽力擦除。
-                create_private_dir(&self.temp_dir)
-                    .map_err(|e| format!("创建临时目录失败: {e}"))?;
-                let zip_path = self.temp_dir.join(format!("zip-{}.tmp", Uuid::new_v4()));
-                if let Err(e) = zip_directory_to_file(&p, &zip_path) {
-                    let _ = fs::remove_file(&zip_path);
-                    return Err(e);
+        struct EncryptedItem {
+            p_str: String,
+            p: PathBuf,
+            name: String,
+            blob_name: String,
+            blob_path: PathBuf,
+            size: u64,
+            kind: String,
+        }
+
+        let total_files = valid_paths.len();
+        let existing = self.entries.clone();
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(valid_paths.len())
+            .min(16);
+
+        let tasks = std::sync::Mutex::new(valid_paths.into_iter().enumerate().collect::<Vec<_>>());
+        let results = std::sync::Mutex::new(Vec::new());
+        let on_progress_mutex = std::sync::Mutex::new(&mut on_progress);
+        let data_dir = &self.data_dir;
+        let temp_dir = &self.temp_dir;
+        let mk_bytes = *mk;
+
+        std::thread::scope(|s| {
+            for _ in 0..concurrency {
+                s.spawn(|| {
+                    loop {
+                        let item = {
+                            let mut lock = tasks.lock().unwrap();
+                            lock.pop()
+                        };
+                        let (idx, (p_str, p, name, is_dir)) = match item {
+                            Some(val) => val,
+                            None => break,
+                        };
+
+                        let blob_name = format!("{}.bin", Uuid::new_v4());
+                        let blob_path = data_dir.join(&blob_name);
+
+                        let res = if is_dir {
+                            let zip_path = temp_dir.join(format!("zip-{}.tmp", Uuid::new_v4()));
+                            if let Err(e) = zip_directory_to_file(&p, &zip_path) {
+                                let _ = fs::remove_file(&zip_path);
+                                Err(e)
+                            } else {
+                                let enc_res = crypto::encrypt_file_stream_with_progress(
+                                    &zip_path,
+                                    &blob_path,
+                                    &mk_bytes,
+                                    |done, total| {
+                                        if let Ok(mut cb) = on_progress_mutex.lock() {
+                                            let percent = if total > 0 {
+                                                (done as f32 / total as f32) * 100.0
+                                            } else {
+                                                100.0
+                                            };
+                                            cb(crate::models::OperationProgress {
+                                                stage: "encrypt".to_string(),
+                                                current_file: idx + 1,
+                                                total_files,
+                                                file_name: name.clone(),
+                                                processed_bytes: done,
+                                                total_bytes: total,
+                                                percent,
+                                                is_finished: false,
+                                            });
+                                        }
+                                    },
+                                );
+                                let _ = best_effort_erase_file(&zip_path);
+                                enc_res.map(|s| ("folder".to_string(), s))
+                            }
+                        } else {
+                            crypto::encrypt_file_stream_with_progress(
+                                &p,
+                                &blob_path,
+                                &mk_bytes,
+                                |done, total| {
+                                    if let Ok(mut cb) = on_progress_mutex.lock() {
+                                        let percent = if total > 0 {
+                                            (done as f32 / total as f32) * 100.0
+                                        } else {
+                                            100.0
+                                        };
+                                        cb(crate::models::OperationProgress {
+                                            stage: "encrypt".to_string(),
+                                            current_file: idx + 1,
+                                            total_files,
+                                            file_name: name.clone(),
+                                            processed_bytes: done,
+                                            total_bytes: total,
+                                            percent,
+                                            is_finished: false,
+                                        });
+                                    }
+                                },
+                            )
+                            .map(|s| ("file".to_string(), s))
+                        };
+
+                        let mut res_lock = results.lock().unwrap();
+                        match res {
+                            Ok((kind, size)) => {
+                                res_lock.push(Ok(EncryptedItem {
+                                    p_str,
+                                    p,
+                                    name,
+                                    blob_name,
+                                    blob_path,
+                                    size,
+                                    kind,
+                                }));
+                            }
+                            Err(e) => {
+                                res_lock.push(Err(e));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let items = results.into_inner().unwrap();
+        let mut added: Vec<VaultEntry> = Vec::new();
+        for item_res in items {
+            let item = match item_res {
+                Ok(it) => it,
+                Err(err) => {
+                    for entry in &added {
+                        let _ = fs::remove_file(self.data_dir.join(&entry.cipher_path));
+                    }
+                    return Err(err);
                 }
-                let enc_result = crypto::encrypt_file_stream(&zip_path, &blob_path, &mk);
-                let _ = best_effort_erase_file(&zip_path);
-                let s = enc_result?;
-                ("folder".to_string(), s)
-            } else {
-                // 超大文件流式分块加密，峰值内存占用仅 ~4MB，支持任意 GB 级文件
-                let s = crypto::encrypt_file_stream(&p, &blob_path, &mk)?;
-                ("file".to_string(), s)
             };
 
-            // 同名 + 同大小视为重复
             let is_dup = existing.iter().chain(added.iter()).any(|e| {
-                e.name == name && e.size == size
+                e.name == item.name && e.size == item.size
             });
             if is_dup {
-                let _ = fs::remove_file(&blob_path);
+                let _ = fs::remove_file(&item.blob_path);
                 skipped += 1;
                 continue;
             }
 
             let entry = VaultEntry {
-                id: id.clone(),
-                name: name.clone(),
-                size,
+                id: Uuid::new_v4().to_string(),
+                name: item.name,
+                size: item.size,
                 added_at: Utc::now().timestamp_millis(),
-                kind,
-                original_path: Some(p_str.clone()),
-                cipher_path: blob_name,
+                kind: item.kind,
+                original_path: Some(item.p_str),
+                cipher_path: item.blob_name,
             };
             added.push(entry);
 
-            // 原文件移入废纸篓（若源文件在 vault 目录内则不移除，避免误删自己）。
             if let Ok(vault_canon) = self.vault_dir.canonicalize() {
-                if let Ok(p_canon) = p.canonicalize() {
+                if let Ok(p_canon) = item.p.canonicalize() {
                     if p_canon.starts_with(&vault_canon) {
                         continue;
                     }
                 }
             }
-            let _ = vfs::move_to_trash(&p);
+            let _ = vfs::move_to_trash(&item.p);
         }
 
         self.entries.extend(added.iter().cloned());
@@ -1250,21 +1379,67 @@ impl VaultManager {
     }
 
     pub fn export_entries_to_dir(&self, ids: &[String], dir: &str) -> Result<(), String> {
+        self.export_entries_to_dir_with_progress(ids, dir, |_| {})
+    }
+
+    pub fn export_entries_to_dir_with_progress<F>(
+        &self,
+        ids: &[String],
+        dir: &str,
+        mut on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(crate::models::OperationProgress),
+    {
         let mk = self.require_unlocked()?;
         let target_dir = PathBuf::from(dir);
         fs::create_dir_all(&target_dir).map_err(|e| format!("创建目录失败: {e}"))?;
-        for id in ids {
+        let total_files = ids.len();
+
+        for (idx, id) in ids.iter().enumerate() {
             let entry = match self.entries.iter().find(|e| e.id == *id).cloned() {
                 Some(e) => e,
                 None => continue,
             };
             let blob_path = self.data_dir.join(&entry.cipher_path);
+            let entry_name = entry.name.clone();
             if entry.kind == "folder" {
                 let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
                 Self::extract_folder_to(&data, &entry.name, &target_dir)?;
+                on_progress(crate::models::OperationProgress {
+                    stage: "export".to_string(),
+                    current_file: idx + 1,
+                    total_files,
+                    file_name: entry_name,
+                    processed_bytes: entry.size,
+                    total_bytes: entry.size,
+                    percent: 100.0,
+                    is_finished: false,
+                });
             } else {
                 let p = Self::unique_path(&target_dir, &entry.name);
-                crypto::decrypt_file_stream(&blob_path, &p, &mk)?;
+                crypto::decrypt_file_stream_with_progress(
+                    &blob_path,
+                    &p,
+                    &mk,
+                    |done, total| {
+                        let percent = if total > 0 {
+                            (done as f32 / total as f32) * 100.0
+                        } else {
+                            100.0
+                        };
+                        on_progress(crate::models::OperationProgress {
+                            stage: "export".to_string(),
+                            current_file: idx + 1,
+                            total_files,
+                            file_name: entry_name.clone(),
+                            processed_bytes: done,
+                            total_bytes: total,
+                            percent,
+                            is_finished: false,
+                        });
+                    },
+                )?;
             }
         }
         Ok(())
@@ -2270,6 +2445,50 @@ mod tests {
             .unwrap_err()
             .contains("相同字符"));
         assert!(vm.set_password("StrongPass123!", false).is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_parallel_multi_file_add_and_export() {
+        let base = tmp_base("parallel_perf");
+        let mut vm = make_test_vm(&base, "vault-parallel");
+        vm.set_password("MyPerfPass123!", false).unwrap();
+
+        let source_dir = base.join("src_files");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let file_path = source_dir.join(format!("test_doc_{i}.txt"));
+            fs::write(&file_path, format!("File payload data for index {i}").repeat(500)).unwrap();
+            paths.push(file_path.to_string_lossy().to_string());
+        }
+
+        let mut progress_count = 0;
+        let added = vm
+            .add_files_with_progress(paths, |_prog| {
+                progress_count += 1;
+            })
+            .unwrap();
+
+        assert_eq!(added.len(), 6);
+        assert_eq!(vm.entries.len(), 6);
+        assert!(progress_count >= 6);
+
+        // 验证导出
+        let export_dir = base.join("exported");
+        let ids: Vec<String> = vm.entries.iter().map(|e| e.id.clone()).collect();
+        vm.export_entries_to_dir(&ids, &export_dir.to_string_lossy()).unwrap();
+
+        for i in 0..6 {
+            let exported_file = export_dir.join(format!("test_doc_{i}.txt"));
+            assert!(exported_file.exists());
+            assert_eq!(
+                fs::read_to_string(&exported_file).unwrap(),
+                format!("File payload data for index {i}").repeat(500)
+            );
+        }
 
         let _ = fs::remove_dir_all(&base);
     }

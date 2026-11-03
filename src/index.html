@@ -770,6 +770,89 @@
     border-radius: 20px;
     border: 1px solid rgba(56, 189, 248, 0.25);
   }
+
+  /* 虚拟滚动容器 */
+  .virtual-spacer {
+    width: 100%;
+    position: relative;
+    pointer-events: none;
+  }
+  .virtual-content {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    will-change: transform;
+  }
+
+  /* 实时传输进度浮窗 */
+  .progress-toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9998;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 18px;
+    width: 330px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.15);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+  }
+  .progress-toast.hidden {
+    opacity: 0;
+    transform: translateY(20px);
+    pointer-events: none;
+    visibility: hidden;
+  }
+  .progress-toast-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .progress-toast-icon { font-size: 16px; }
+  .progress-toast-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .progress-toast-badge {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--primary);
+  }
+  .progress-track {
+    width: 100%;
+    height: 6px;
+    background: var(--border-light);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary), #38BDF8);
+    border-radius: 3px;
+    transition: width 0.15s ease-out;
+  }
+  .progress-toast-detail {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+  .progress-file-info {
+    max-width: 190px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -827,6 +910,22 @@
   <div class="dropdown-item" data-action="create-vault">＋ 新建保险箱…</div>
   <div class="dropdown-item" data-action="rename-vault">✏️ 重命名当前保险箱…</div>
   <div class="dropdown-item danger" data-action="delete-vault">🗑 删除当前保险箱…</div>
+</div>
+
+<!-- 实时操作进度浮窗 -->
+<div class="progress-toast hidden" id="operationProgressCard">
+  <div class="progress-toast-header">
+    <div class="progress-toast-icon" id="progressToastIcon">⚡</div>
+    <div class="progress-toast-title" id="progressToastTitle">正在处理…</div>
+    <div class="progress-toast-badge" id="progressToastBadge">0%</div>
+  </div>
+  <div class="progress-track">
+    <div class="progress-fill" id="progressToastFill" style="width: 0%;"></div>
+  </div>
+  <div class="progress-toast-detail">
+    <span class="progress-file-info" id="progressToastFile">准备中…</span>
+    <span class="progress-bytes-info" id="progressToastBytes">0 / 0</span>
+  </div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
