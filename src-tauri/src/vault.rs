@@ -17,8 +17,8 @@ use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 #[derive(Debug)]
 pub struct VaultManager {
     pub entries: Vec<VaultEntry>,
-    /// 主密钥用 `Zeroizing` 包裹，离开作用域（含栈上临时副本）时自动清零。
-    pub master_key: Option<Zeroizing<[u8; 32]>>,
+    /// 主密钥使用 ProtectedMasterKey 锁定在物理内存（mlock），防止 swap 到磁盘，离开作用域时自动清零与解锁。
+    pub master_key: Option<crypto::ProtectedMasterKey>,
     pub is_unlocked: bool,
     pub data_base: PathBuf,
     pub current_vault_id: String,
@@ -512,16 +512,28 @@ impl VaultManager {
             .try_into()
             .expect("长度必为 32");
 
-        // 密码盐 + KEK 包装
+        // 密码盐 + KEK 包装（Argon2id）
         let password_salt = crypto::random_bytes(crypto::SALT_LEN);
-        let mut password_kek = crypto::derive_key_password(password, &password_salt);
+        let mut password_kek = crypto::derive_key_argon2id(
+            password,
+            &password_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let password_wrap = crypto::encrypt(&master_key, &password_kek)?;
         crypto::zeroize_slice(&mut password_kek);
 
-        // 恢复码
+        // 恢复码（Argon2id）
         let recovery_code = crypto::generate_recovery_code();
         let recovery_salt = crypto::random_bytes(crypto::SALT_LEN);
-        let mut recovery_kek = crypto::derive_key_recovery(&recovery_code, &recovery_salt);
+        let mut recovery_kek = crypto::derive_key_recovery_argon2id(
+            &recovery_code,
+            &recovery_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let recovery_wrap = crypto::encrypt(&master_key, &recovery_kek)?;
         crypto::zeroize_slice(&mut recovery_kek);
 
@@ -530,8 +542,14 @@ impl VaultManager {
             password_wrap,
             recovery_salt,
             recovery_wrap,
-            iterations: Some(crypto::PBKDF2_ITERATIONS),
-            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
+            iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            recovery_iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
         };
         let keyring_json =
             serde_json::to_vec(&keyring).map_err(|e| format!("序列化 keyring 失败: {e}"))?;
@@ -540,7 +558,7 @@ impl VaultManager {
 
         // 空索引
         self.entries = Vec::new();
-        self.master_key = Some(Zeroizing::new(master_key));
+        self.master_key = Some(crypto::ProtectedMasterKey::new(master_key));
         self.is_unlocked = true;
         self.failed_attempts = 0;
         self.lockout_until = None;
@@ -613,7 +631,7 @@ impl VaultManager {
         };
 
         self.entries = self.load_index_with_key(&master_key)?;
-        self.master_key = Some(Zeroizing::new(master_key));
+        self.master_key = Some(crypto::ProtectedMasterKey::new(master_key));
         self.is_unlocked = true;
         self.touch();
 
@@ -632,8 +650,10 @@ impl VaultManager {
         let keyring: Keyring =
             serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
 
-        // 旧版 keyring 未记录 iterations 时使用历史值 600,000；
-        // 恢复码包装当时与密码包装共用同一参数。
+        let kdf_type = keyring
+            .kdf_type
+            .as_deref()
+            .unwrap_or(crypto::KDF_TYPE_PBKDF2);
         let iters = keyring
             .iterations
             .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
@@ -642,7 +662,21 @@ impl VaultManager {
             .or(keyring.iterations)
             .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
 
-        let mut kek = crypto::derive_key_password_with_iter(password, &salt, iters);
+        let mut kek = if kdf_type == crypto::KDF_TYPE_ARGON2ID {
+            let mem = keyring
+                .memory_kib
+                .unwrap_or(crypto::ARGON2_DEFAULT_MEMORY_KIB);
+            let p_iters = keyring
+                .iterations
+                .unwrap_or(crypto::ARGON2_DEFAULT_ITERATIONS);
+            let par = keyring
+                .parallelism
+                .unwrap_or(crypto::ARGON2_DEFAULT_PARALLELISM);
+            crypto::derive_key_argon2id(password, &salt, mem, p_iters, par)?
+        } else {
+            crypto::derive_key_password_with_iter(password, &salt, iters)
+        };
+
         let mk_bytes = crypto::decrypt(&keyring.password_wrap, &kek)?;
         crypto::zeroize_slice(&mut kek);
         if mk_bytes.len() != 32 {
@@ -651,22 +685,37 @@ impl VaultManager {
         let mut mk = [0u8; 32];
         mk.copy_from_slice(&mk_bytes);
 
-        // 仅单向升级：迭代次数低于当前目标时才用更高参数重新包装，绝不降低强度。
-        // 恢复码包装在不知道恢复码的情况下无法同步升级，因此原样保留其旧参数。
-        if iters < crypto::PBKDF2_ITERATIONS {
-            let mut new_kek =
-                crypto::derive_key_password_with_iter(password, &salt, crypto::PBKDF2_ITERATIONS);
-            let upgraded = crypto::encrypt(&mk, &new_kek);
-            crypto::zeroize_slice(&mut new_kek);
-            // 升级失败不影响本次解锁，下次解锁会再次尝试。
-            if let Ok(new_wrap) = upgraded {
-                let mut updated = keyring.clone();
-                updated.version = KEYRING_VERSION;
-                updated.password_wrap = new_wrap;
-                updated.iterations = Some(crypto::PBKDF2_ITERATIONS);
-                updated.recovery_iterations = Some(recovery_iters);
-                if let Ok(bytes) = serde_json::to_vec(&updated) {
-                    let _ = atomic_write(&self.keyring_path(), &bytes);
+        // 仅单向升级：若旧版本使用 PBKDF2 或未升级至 Argon2id，成功解锁后单向机会性升级至 Argon2id。
+        // 恢复码包装在不知道恢复码的情况下无法同步升级，因此原样保留其旧参数与类型。
+        if kdf_type != crypto::KDF_TYPE_ARGON2ID {
+            let rec_kdf = keyring
+                .recovery_kdf_type
+                .clone()
+                .or_else(|| keyring.kdf_type.clone())
+                .unwrap_or_else(|| crypto::KDF_TYPE_PBKDF2.to_string());
+            let new_kek = crypto::derive_key_argon2id(
+                password,
+                &salt,
+                crypto::ARGON2_DEFAULT_MEMORY_KIB,
+                crypto::ARGON2_DEFAULT_ITERATIONS,
+                crypto::ARGON2_DEFAULT_PARALLELISM,
+            );
+            if let Ok(mut new_kek) = new_kek {
+                let upgraded = crypto::encrypt(&mk, &new_kek);
+                crypto::zeroize_slice(&mut new_kek);
+                if let Ok(new_wrap) = upgraded {
+                    let mut updated = keyring.clone();
+                    updated.version = KEYRING_VERSION;
+                    updated.password_wrap = new_wrap;
+                    updated.kdf_type = Some(crypto::KDF_TYPE_ARGON2ID.to_string());
+                    updated.memory_kib = Some(crypto::ARGON2_DEFAULT_MEMORY_KIB);
+                    updated.iterations = Some(crypto::ARGON2_DEFAULT_ITERATIONS);
+                    updated.parallelism = Some(crypto::ARGON2_DEFAULT_PARALLELISM);
+                    updated.recovery_kdf_type = Some(rec_kdf);
+                    updated.recovery_iterations = Some(recovery_iters);
+                    if let Ok(bytes) = serde_json::to_vec(&updated) {
+                        let _ = atomic_write(&self.keyring_path(), &bytes);
+                    }
                 }
             }
         }
@@ -679,13 +728,35 @@ impl VaultManager {
             fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
         let keyring: Keyring =
             serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
-        // 恢复码包装使用 keyring 中记录的参数；缺失时回退到与密码包装相同的值。
-        let iters = keyring
-            .recovery_iterations
-            .or(keyring.iterations)
-            .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
-        let mut kek =
-            crypto::derive_key_recovery_with_iter(code, &keyring.recovery_salt, iters);
+
+        let rec_kdf = keyring
+            .recovery_kdf_type
+            .as_deref()
+            .or(keyring.kdf_type.as_deref())
+            .unwrap_or(crypto::KDF_TYPE_PBKDF2);
+
+        let mut kek = if rec_kdf == crypto::KDF_TYPE_ARGON2ID {
+            let mem = keyring
+                .recovery_memory_kib
+                .or(keyring.memory_kib)
+                .unwrap_or(crypto::ARGON2_DEFAULT_MEMORY_KIB);
+            let iters = keyring
+                .recovery_iterations
+                .or(keyring.iterations)
+                .unwrap_or(crypto::ARGON2_DEFAULT_ITERATIONS);
+            let par = keyring
+                .recovery_parallelism
+                .or(keyring.parallelism)
+                .unwrap_or(crypto::ARGON2_DEFAULT_PARALLELISM);
+            crypto::derive_key_recovery_argon2id(code, &keyring.recovery_salt, mem, iters, par)?
+        } else {
+            let iters = keyring
+                .recovery_iterations
+                .or(keyring.iterations)
+                .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+            crypto::derive_key_recovery_with_iter(code, &keyring.recovery_salt, iters)
+        };
+
         let mk_bytes = crypto::decrypt(&keyring.recovery_wrap, &kek)?;
         crypto::zeroize_slice(&mut kek);
         if mk_bytes.len() != 32 {
@@ -704,13 +775,25 @@ impl VaultManager {
         password: &str,
     ) -> Result<String, String> {
         let password_salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
-        let mut password_kek = crypto::derive_key_password(password, &password_salt);
+        let mut password_kek = crypto::derive_key_argon2id(
+            password,
+            &password_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let password_wrap = crypto::encrypt(master_key, &password_kek)?;
         crypto::zeroize_slice(&mut password_kek);
 
         let recovery_code = crypto::generate_recovery_code();
         let recovery_salt = crypto::random_bytes(crypto::SALT_LEN);
-        let mut recovery_kek = crypto::derive_key_recovery(&recovery_code, &recovery_salt);
+        let mut recovery_kek = crypto::derive_key_recovery_argon2id(
+            &recovery_code,
+            &recovery_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let recovery_wrap = crypto::encrypt(master_key, &recovery_kek)?;
         crypto::zeroize_slice(&mut recovery_kek);
 
@@ -719,8 +802,14 @@ impl VaultManager {
             password_wrap,
             recovery_salt,
             recovery_wrap,
-            iterations: Some(crypto::PBKDF2_ITERATIONS),
-            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
+            iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            recovery_iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -1260,14 +1349,24 @@ impl VaultManager {
                 .map_err(|e| format!("读取 keyring 失败: {e}"))?;
             let keyring: Keyring = serde_json::from_slice(&keyring_bytes)
                 .map_err(|e| format!("解析 keyring 失败: {e}"))?;
-            let iters = keyring.iterations.unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
-            let kek = crypto::derive_key_password_with_iter(old, &salt, iters);
+            let kdf_type = keyring.kdf_type.as_deref().unwrap_or(crypto::KDF_TYPE_PBKDF2);
+            let mut kek = if kdf_type == crypto::KDF_TYPE_ARGON2ID {
+                let mem = keyring.memory_kib.unwrap_or(crypto::ARGON2_DEFAULT_MEMORY_KIB);
+                let iters = keyring.iterations.unwrap_or(crypto::ARGON2_DEFAULT_ITERATIONS);
+                let par = keyring.parallelism.unwrap_or(crypto::ARGON2_DEFAULT_PARALLELISM);
+                crypto::derive_key_argon2id(old, &salt, mem, iters, par)?
+            } else {
+                let iters = keyring.iterations.unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+                crypto::derive_key_password_with_iter(old, &salt, iters)
+            };
             let _ = crypto::decrypt(&keyring.password_wrap, &kek)?;
+            crypto::zeroize_slice(&mut kek);
         } else {
             let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
-            let kek = crypto::derive_key_password(old, &salt);
+            let mut kek = crypto::derive_key_password(old, &salt);
             let enc = fs::read(self.index_path()).map_err(|e| format!("读取索引失败: {e}"))?;
             let _ = crypto::decrypt(&enc, &kek)?;
+            crypto::zeroize_slice(&mut kek);
         }
 
         let new_recovery = crypto::generate_recovery_code();
@@ -1334,7 +1433,7 @@ impl VaultManager {
             let _ = keychain::save_password(&self.current_vault_id, new_password);
         }
         self.entries = self.load_index_with_key(&mk)?;
-        self.master_key = Some(Zeroizing::new(mk));
+        self.master_key = Some(crypto::ProtectedMasterKey::new(mk));
         self.is_unlocked = true;
         self.failed_attempts = 0;
         self.lockout_until = None;
@@ -1350,12 +1449,24 @@ impl VaultManager {
         recovery_code: &str,
     ) -> Result<(), String> {
         let password_salt = crypto::random_bytes(crypto::SALT_LEN);
-        let mut password_kek = crypto::derive_key_password(password, &password_salt);
+        let mut password_kek = crypto::derive_key_argon2id(
+            password,
+            &password_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let password_wrap = crypto::encrypt(master_key, &password_kek)?;
         crypto::zeroize_slice(&mut password_kek);
 
         let recovery_salt = crypto::random_bytes(crypto::SALT_LEN);
-        let mut recovery_kek = crypto::derive_key_recovery(recovery_code, &recovery_salt);
+        let mut recovery_kek = crypto::derive_key_recovery_argon2id(
+            recovery_code,
+            &recovery_salt,
+            crypto::ARGON2_DEFAULT_MEMORY_KIB,
+            crypto::ARGON2_DEFAULT_ITERATIONS,
+            crypto::ARGON2_DEFAULT_PARALLELISM,
+        )?;
         let recovery_wrap = crypto::encrypt(master_key, &recovery_kek)?;
         crypto::zeroize_slice(&mut recovery_kek);
 
@@ -1364,8 +1475,14 @@ impl VaultManager {
             password_wrap,
             recovery_salt,
             recovery_wrap,
-            iterations: Some(crypto::PBKDF2_ITERATIONS),
-            recovery_iterations: Some(crypto::PBKDF2_ITERATIONS),
+            iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            recovery_iterations: Some(crypto::ARGON2_DEFAULT_ITERATIONS),
+            kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
+            recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
+            recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -1731,7 +1848,7 @@ mod tests {
 
         let mut vm = VaultManager {
             entries: Vec::new(),
-            master_key: Some(Zeroizing::new([7u8; 32])),
+            master_key: Some(crypto::ProtectedMasterKey::new([7u8; 32])),
             is_unlocked: true,
             data_base: temp_dir.clone(),
             current_vault_id: "default".into(),
@@ -1783,7 +1900,7 @@ mod tests {
 
         let mut vm = VaultManager {
             entries: Vec::new(),
-            master_key: Some(Zeroizing::new([7u8; 32])),
+            master_key: Some(crypto::ProtectedMasterKey::new([7u8; 32])),
             is_unlocked: true,
             data_base: temp_dir.clone(),
             current_vault_id: "default".into(),
@@ -2030,17 +2147,25 @@ mod tests {
             recovery_wrap,
             iterations: Some(100_000),
             recovery_iterations: None,
+            kdf_type: Some("pbkdf2".to_string()),
+            memory_kib: None,
+            parallelism: None,
+            recovery_kdf_type: Some("pbkdf2".to_string()),
+            recovery_memory_kib: None,
+            recovery_parallelism: None,
         };
         atomic_write(&vm.keyring_path(), &serde_json::to_vec(&legacy).unwrap()).unwrap();
 
-        // 解锁成功后应单向升级到 600,000，且绝不降到 100,000
+        // 解锁成功后应单向升级到 Argon2id，且绝不降到 100,000
         vm.lock();
         vm.unlock("OldPassword123!", false).unwrap();
         let upgraded: Keyring =
             serde_json::from_slice(&fs::read(vm.keyring_path()).unwrap()).unwrap();
         assert_eq!(upgraded.version, KEYRING_VERSION);
-        assert_eq!(upgraded.iterations, Some(crypto::PBKDF2_ITERATIONS));
+        assert_eq!(upgraded.kdf_type.as_deref(), Some(crypto::KDF_TYPE_ARGON2ID));
+        assert_eq!(upgraded.iterations, Some(crypto::ARGON2_DEFAULT_ITERATIONS));
         assert_eq!(upgraded.recovery_iterations, Some(100_000));
+        assert_eq!(upgraded.recovery_kdf_type.as_deref(), Some("pbkdf2"));
 
         // 升级后旧恢复码仍然有效
         vm.lock();

@@ -31,6 +31,24 @@ pub struct Keyring {
     /// 单独记录是因为恢复码包装无法在未知恢复码时随密码包装一起升级。
     #[serde(default)]
     pub recovery_iterations: Option<u32>,
+    /// KDF 算法类型："pbkdf2"（默认旧版）或 "argon2id"
+    #[serde(default)]
+    pub kdf_type: Option<String>,
+    /// Argon2id 内存占用（KiB），例如 65536（64MB）
+    #[serde(default)]
+    pub memory_kib: Option<u32>,
+    /// Argon2id 并行度（lanes/threads）
+    #[serde(default)]
+    pub parallelism: Option<u32>,
+    /// 恢复码包装使用的 KDF 算法类型
+    #[serde(default)]
+    pub recovery_kdf_type: Option<String>,
+    /// 恢复码包装的 Argon2id 内存占用（KiB）
+    #[serde(default)]
+    pub recovery_memory_kib: Option<u32>,
+    /// 恢复码包装的 Argon2id 并行度
+    #[serde(default)]
+    pub recovery_parallelism: Option<u32>,
 }
 
 /// 索引加密落盘格式：nonce + ciphertext。

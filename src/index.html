@@ -711,10 +711,79 @@
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+
+  /* 窗口失焦防窥遮罩 */
+  .privacy-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 10000;
+    background: rgba(15, 23, 42, 0.72);
+    backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 1;
+    transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    cursor: pointer;
+  }
+  .privacy-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
+  }
+  .privacy-card {
+    text-align: center;
+    padding: 32px 40px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 16px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+    max-width: 380px;
+  }
+  .privacy-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    filter: drop-shadow(0 4px 12px rgba(0, 122, 255, 0.4));
+  }
+  .privacy-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: #F8FAFC;
+    margin-bottom: 8px;
+  }
+  .privacy-desc {
+    font-size: 13px;
+    color: #94A3B8;
+    line-height: 1.6;
+    margin-bottom: 16px;
+  }
+  .privacy-tip {
+    display: inline-block;
+    font-size: 12px;
+    color: #38BDF8;
+    background: rgba(56, 189, 248, 0.12);
+    padding: 6px 14px;
+    border-radius: 20px;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+  }
 </style>
 </head>
 <body>
 <div id="app"></div>
+
+<!-- 防窥隐私遮罩 -->
+<div class="privacy-overlay hidden" id="privacyOverlay">
+  <div class="privacy-card">
+    <div class="privacy-icon">🔒</div>
+    <div class="privacy-title">防窥保护已开启</div>
+    <div class="privacy-desc">窗口已离开前台焦点，文件列表与隐私内容已受到模糊遮蔽</div>
+    <div class="privacy-tip">点击窗口任意位置即可恢复</div>
+  </div>
+</div>
 
 <div class="context-menu" id="contextMenu">
   <div class="context-menu-item" data-action="open">👁 打开</div>
@@ -727,6 +796,7 @@
 
 <div class="dropdown-menu" id="gearMenu">
   <div class="dropdown-item" data-action="changepw">🔒 修改密码…</div>
+  <div class="dropdown-item" data-action="toggle-privacy-blur" id="gearPrivacyBlurItem">🛡️ 窗口防窥保护：已开启</div>
   <div class="dropdown-item has-submenu" data-action="autolock">
     <span>⏱ 自动锁定</span>
     <span class="dropdown-submenu-indicator">◀</span>

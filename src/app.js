@@ -36,7 +36,14 @@ const state = {
   modalOpen: false,
   lockoutRemaining: 0,
   lockoutInterval: null,
+  privacyBlurEnabled: localStorage.getItem('filelocker_privacy_blur') !== 'false',
+  pickingFile: false,
 };
+
+function hidePrivacyOverlay() {
+  const overlay = $('#privacyOverlay');
+  if (overlay) overlay.classList.add('hidden');
+}
 
 // ===== Utility =====
 const $ = s => document.querySelector(s);
@@ -119,6 +126,46 @@ function showToast(msg, isError = false) {
   }, 2500);
 }
 function showError(msg) { showToast(msg, true); }
+
+let clipboardTimerId = null;
+function startClipboardCountdown(seconds = 30, label = '恢复码') {
+  if (clipboardTimerId) clearInterval(clipboardTimerId);
+  const container = $('#toastContainer');
+  let remaining = seconds;
+  const t = el('div', { class: 'toast' }, `📋 ${label}已复制（防窥保护：${remaining}s 后自动清空）`);
+  container.appendChild(t);
+
+  clipboardTimerId = setInterval(() => {
+    remaining--;
+    if (remaining > 0) {
+      t.textContent = `📋 ${label}已复制（防窥保护：${remaining}s 后自动清空）`;
+    } else {
+      clearInterval(clipboardTimerId);
+      clipboardTimerId = null;
+      t.textContent = `🧹 剪贴板已自动清空，保护您的隐私安全`;
+      setTimeout(() => {
+        t.style.transition = 'opacity 0.3s, transform 0.3s';
+        t.style.opacity = '0';
+        t.style.transform = 'translateY(-10px)';
+        setTimeout(() => t.remove(), 300);
+      }, 2500);
+    }
+  }, 1000);
+}
+
+async function copySensitiveWithNotice(text, label = '恢复码') {
+  try {
+    await invoke('copy_sensitive_text', { text, timeoutSecs: 30 });
+    startClipboardCountdown(30, label);
+  } catch (err) {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`${label}已复制`);
+    } catch {
+      showToast('复制失败，请手动选择复制', true);
+    }
+  }
+}
 
 // ===== 密码强度检测 =====
 function checkPasswordStrength(pwd) {
@@ -502,12 +549,7 @@ function renderRecoveryCode() {
   const copyBtn = el('button', {
     class: 'btn btn-secondary',
     style: 'margin-bottom:12px;',
-    onclick: async () => {
-      try {
-        await navigator.clipboard.writeText(state.pendingRecoveryCode);
-        showToast('恢复码已复制');
-      } catch { showToast('复制失败，请手动复制', true); }
-    }
+    onclick: () => copySensitiveWithNotice(state.pendingRecoveryCode, '恢复码')
   }, '📋 复制恢复码');
   const done = () => { state.pendingRecoveryCode = ''; enterMain(); };
 
@@ -579,10 +621,8 @@ function renderRecoveryFlow() {
   } else {
     const copyBtn = el('button', {
       class: 'btn btn-secondary', style: 'margin-bottom:12px;',
-      onclick: async () => {
-        try { await navigator.clipboard.writeText(state.pendingRecoveryCode); showToast('已复制'); } catch {}
-      }
-    }, '📋 复制');
+      onclick: () => copySensitiveWithNotice(state.pendingRecoveryCode, '恢复码')
+    }, '📋 复制恢复码');
     const done = async () => {
       try {
         const entries = await invoke('list_entries');
@@ -938,17 +978,20 @@ async function openEntry(id) {
 
 async function exportEntry(entry) {
   try {
+    state.pickingFile = true;
     const savePath = await invoke('pick_save_path', { defaultName: entry.name }).catch(() => null);
     if (!savePath) return;
     await invoke('export_entry', { id: entry.id, targetPath: savePath });
     showToast('导出成功');
   } catch (e) { showError('导出失败: ' + e); }
+  finally { setTimeout(() => { state.pickingFile = false; }, 500); }
 }
 
 async function exportSelected() {
   const ids = Array.from(state.selectedIds);
   if (ids.length === 0) return;
   try {
+    state.pickingFile = true;
     const picked = await invoke('pick_paths', { directory: true, multiple: false }).catch(() => null);
     const targetDir = picked && picked.length > 0 ? picked[0] : null;
     if (!targetDir) return;
@@ -958,6 +1001,7 @@ async function exportSelected() {
     state.multiSelectMode = false;
     render();
   } catch (e) { showError('导出失败: ' + e); }
+  finally { setTimeout(() => { state.pickingFile = false; }, 500); }
 }
 
 async function restoreEntry(id) {
@@ -997,6 +1041,7 @@ async function deleteSelected() {
 }
 
 async function doLock() {
+  hidePrivacyOverlay();
   try { await invoke('lock'); } catch {}
   state.entries = [];
   state.selectedIds.clear();
@@ -1085,6 +1130,23 @@ window.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('dragover', e => {
     if (state.screen === 'main') e.preventDefault();
   });
+
+  // 窗口失焦防窥保护
+  window.addEventListener('blur', () => {
+    if (state.screen === 'main' && state.privacyBlurEnabled && !state.pickingFile) {
+      const overlay = $('#privacyOverlay');
+      if (overlay) overlay.classList.remove('hidden');
+    }
+  });
+  window.addEventListener('focus', () => {
+    hidePrivacyOverlay();
+  });
+  const privacyOverlay = $('#privacyOverlay');
+  if (privacyOverlay) {
+    privacyOverlay.addEventListener('click', () => {
+      hidePrivacyOverlay();
+    });
+  }
 });
 
 async function addFilesByPaths(paths) {
@@ -1166,6 +1228,16 @@ document.addEventListener('click', e => {
   if (gItem) {
     const action = gItem.dataset.action;
     if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
+    else if (action === 'toggle-privacy-blur') {
+      state.privacyBlurEnabled = !state.privacyBlurEnabled;
+      localStorage.setItem('filelocker_privacy_blur', state.privacyBlurEnabled ? 'true' : 'false');
+      const pbItem = $('#gearPrivacyBlurItem');
+      if (pbItem) {
+        pbItem.textContent = `🛡️ 窗口防窥保护：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
+      }
+      showToast(state.privacyBlurEnabled ? '防窥保护已开启' : '防窥保护已关闭');
+      hideGearMenu();
+    }
     else if (action === 'shred-temp') {
       hideGearMenu();
       (async () => {
@@ -1225,9 +1297,11 @@ function hideAddMenu() {
 async function chooseAndAdd(directory) {
   hideAddMenu();
   try {
+    state.pickingFile = true;
     const paths = await invoke('pick_paths', { directory: !!directory, multiple: true }).catch(() => null);
     if (paths && paths.length > 0) await addFilesByPaths(paths);
   } catch (err) { showError('添加失败: ' + err); }
+  finally { setTimeout(() => { state.pickingFile = false; }, 500); }
 }
 
 // ---- Vault Switcher menu ----
@@ -1418,6 +1492,10 @@ function toggleGearMenu(e) {
     it.classList.toggle('active', parseInt(it.dataset.val) === state.autoLockMinutes);
   });
   const menuRect = menu.getBoundingClientRect();
+  const pbItem = $('#gearPrivacyBlurItem');
+  if (pbItem) {
+    pbItem.textContent = `🛡️ 窗口防窥保护：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
+  }
   let x = rect.right - menuRect.width;
   let y = rect.bottom + 6;
   if (x < 10) x = 10;

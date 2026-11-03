@@ -20,6 +20,124 @@ pub const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;
 pub const MASTER_KEY_LEN: usize = 32;
 
+pub const KDF_TYPE_ARGON2ID: &str = "argon2id";
+pub const KDF_TYPE_PBKDF2: &str = "pbkdf2";
+
+/// Argon2id 默认推荐基线（OWASP 密码学基线）：
+/// - 内存占用：64 MB (65,536 KiB)
+/// - 迭代轮数：3 次
+/// - 并行线程：4 个
+pub const ARGON2_DEFAULT_MEMORY_KIB: u32 = 64 * 1024;
+pub const ARGON2_DEFAULT_ITERATIONS: u32 = 3;
+pub const ARGON2_DEFAULT_PARALLELISM: u32 = 4;
+
+/// 用 Argon2id 从密码 + 盐派生 32 字节密钥。
+pub fn derive_key_argon2id(
+    password: &str,
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<[u8; KEY_LEN], String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(memory_kib, iterations, parallelism, Some(KEY_LEN))
+        .map_err(|e| format!("Argon2 参数配置无效: {e}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; KEY_LEN];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .map_err(|e| format!("Argon2 密钥派生失败: {e}"))?;
+    Ok(out)
+}
+
+/// 用 Argon2id 从归一化恢复码 + 盐派生 32 字节密钥。
+pub fn derive_key_recovery_argon2id(
+    code: &str,
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<[u8; KEY_LEN], String> {
+    let normalized = normalize_recovery_code(code);
+    derive_key_argon2id(&normalized, salt, memory_kib, iterations, parallelism)
+}
+
+/// 锁定内存范围，防止操作系统将其换出（swap / pagefile）到磁盘。
+pub fn lock_memory(ptr: *const u8, len: usize) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::mlock(ptr as *const libc::c_void, len);
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualLock(lpAddress: *const std::ffi::c_void, dwSize: usize) -> i32;
+        }
+        let _ = VirtualLock(ptr as *const std::ffi::c_void, len);
+    }
+}
+
+/// 解除内存锁定。
+pub fn unlock_memory(ptr: *const u8, len: usize) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::munlock(ptr as *const libc::c_void, len);
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualUnlock(lpAddress: *const std::ffi::c_void, dwSize: usize) -> i32;
+        }
+        let _ = VirtualUnlock(ptr as *const std::ffi::c_void, len);
+    }
+}
+
+/// 受物理内存锁保护的主密钥封装。
+/// 初始化时调用 `mlock`（Unix/macOS）或 `VirtualLock`（Windows）防止操作系统 swap 换出到磁盘；
+/// Drop 时执行 volatile 安全清零并调用 `munlock` / `VirtualUnlock`。
+pub struct ProtectedMasterKey {
+    inner: [u8; MASTER_KEY_LEN],
+}
+
+impl ProtectedMasterKey {
+    pub fn new(key: [u8; MASTER_KEY_LEN]) -> Self {
+        lock_memory(key.as_ptr(), key.len());
+        Self { inner: key }
+    }
+
+    pub fn as_bytes(&self) -> &[u8; MASTER_KEY_LEN] {
+        &self.inner
+    }
+}
+
+impl Clone for ProtectedMasterKey {
+    fn clone(&self) -> Self {
+        Self::new(self.inner)
+    }
+}
+
+impl std::ops::Deref for ProtectedMasterKey {
+    type Target = [u8; MASTER_KEY_LEN];
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for ProtectedMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProtectedMasterKey(***)")
+    }
+}
+
+impl Drop for ProtectedMasterKey {
+    fn drop(&mut self) {
+        zeroize_slice(&mut self.inner);
+        unlock_memory(self.inner.as_ptr(), self.inner.len());
+    }
+}
+
 /// 用 PBKDF2-HMAC-SHA256 从密码 + 盐派生 32 字节密钥（自定义迭代次数）。
 pub fn derive_key_password_with_iter(password: &str, salt: &[u8], iterations: u32) -> [u8; KEY_LEN] {
     let mut out = [0u8; KEY_LEN];
@@ -668,5 +786,39 @@ mod tests {
         let _ = std::fs::remove_file(&enc);
         let _ = std::fs::remove_file(&enc_swapped);
         let _ = std::fs::remove_file(&enc_trailing);
+    }
+
+    #[test]
+    fn test_argon2id_derivation_deterministic() {
+        let salt = [0x5au8; 16];
+        let key1 = derive_key_argon2id("MySecurePass!99", &salt, 1024, 2, 1).unwrap();
+        let key2 = derive_key_argon2id("MySecurePass!99", &salt, 1024, 2, 1).unwrap();
+        assert_eq!(key1, key2);
+
+        let key3 = derive_key_argon2id("OtherSecurePass!99", &salt, 1024, 2, 1).unwrap();
+        assert_ne!(key1, key3);
+
+        let code = "ABCD-EFGH-JKLM-NPQR-STVW-XYZA";
+        let rkey1 = derive_key_recovery_argon2id(code, &salt, 1024, 2, 1).unwrap();
+        let rkey2 = derive_key_recovery_argon2id(
+            "abcd efgh jklm npqr stvw xyza",
+            &salt,
+            1024,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(rkey1, rkey2);
+    }
+
+    #[test]
+    fn test_protected_master_key() {
+        let raw = [42u8; 32];
+        let protected = ProtectedMasterKey::new(raw);
+        assert_eq!(*protected, raw);
+        assert_eq!(protected.as_bytes(), &raw);
+
+        let cloned = protected.clone();
+        assert_eq!(*cloned, raw);
     }
 }
