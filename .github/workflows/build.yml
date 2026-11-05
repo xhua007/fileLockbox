@@ -3,7 +3,7 @@ name: Build Desktop
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
             artifact: macos-universal
           - platform: windows-latest
             rust_targets: x86_64-pc-windows-msvc
-            args: ''
+            args: ""
             artifact: windows-x64
 
     runs-on: ${{ matrix.platform }}

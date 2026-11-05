@@ -49,6 +49,10 @@ pub struct Keyring {
     /// 恢复码包装的 Argon2id 并行度
     #[serde(default)]
     pub recovery_parallelism: Option<u32>,
+    /// 设备密钥包装的主密钥（AES-256-GCM 密文）。当开启“记住密码”时写入，密钥保存在系统钥匙串中。
+    /// 避免在系统钥匙串中直接存放用户明文主密码。
+    #[serde(default)]
+    pub device_wrap: Option<Vec<u8>>,
 }
 
 /// 索引加密落盘格式：nonce + ciphertext。
@@ -66,6 +70,9 @@ pub struct AppConfig {
     pub auto_lock_minutes: Option<u64>,
     #[serde(default)]
     pub current_vault_id: Option<String>,
+    /// 导入文件后是否安全粉碎原文件（而非移入系统废纸篓保留明文）
+    #[serde(default)]
+    pub shred_source_after_import: Option<bool>,
 }
 
 /// 保险箱概况
@@ -104,4 +111,17 @@ pub struct OperationProgress {
     pub total_bytes: u64,
     pub percent: f32,
     pub is_finished: bool,
+}
+
+/// 内存无痕预览数据（0 字节磁盘写入，避免外部 App 缓存与磁盘残留）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EntryPreviewData {
+    pub id: String,
+    pub name: String,
+    /// "image" | "text" | "pdf" | "audio" | "video" | "unsupported"
+    pub kind: String,
+    pub mime_type: String,
+    pub data_base64: Option<String>,
+    pub text_content: Option<String>,
+    pub size: u64,
 }

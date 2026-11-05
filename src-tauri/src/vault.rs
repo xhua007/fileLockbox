@@ -2,8 +2,10 @@ use crate::crypto;
 use crate::fs as vfs;
 use crate::keychain;
 use crate::models::{AppConfig, CreateVaultResult, Keyring, VaultEntry, VaultInfo, VaultProfile};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use directories::ProjectDirs;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -51,10 +53,13 @@ struct GuardState {
 }
 
 /// security.json：按保险箱 id 隔离的防爆破状态集合。
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct GuardFile {
     #[serde(default)]
     vaults: BTreeMap<String, GuardState>,
+    /// HMAC-SHA256 签名（Base64），防本地恶意篡改重置
+    #[serde(default)]
+    hmac: Option<String>,
 }
 
 pub fn app_data_dir() -> PathBuf {
@@ -141,6 +146,19 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// 创建临时目录，并在 Unix 上收紧为 0700，在 macOS 上添加 .metadata_never_index 防 Spotlight / mds 索引缓存。
+fn ensure_temp_dir_hidden(dir: &Path) -> std::io::Result<()> {
+    create_private_dir(dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        let no_index = dir.join(".metadata_never_index");
+        if !no_index.exists() {
+            let _ = fs::write(&no_index, b"");
+        }
     }
     Ok(())
 }
@@ -297,9 +315,18 @@ fn load_meta_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 元数据落盘：统一写入标准原子 JSON。
+/// 元数据落盘：优先使用来自钥匙串的元数据密钥执行 AES-256-GCM 加密，并写入 FLCK_META\x01 魔数头。
+/// 若钥匙串不可用（例如测试环境或无密匙服务的无头服务器），回退写入标准明文 JSON，确保 100% 可用性。
 fn save_meta_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     let json = serde_json::to_vec(value).map_err(|e| format!("序列化元数据失败: {e}"))?;
+    if let Some(key) = metadata_key() {
+        if let Ok(enc) = crypto::encrypt(&json, &key) {
+            let mut out = Vec::with_capacity(META_MAGIC.len() + enc.len());
+            out.extend_from_slice(META_MAGIC);
+            out.extend_from_slice(&enc);
+            return atomic_write(path, &out);
+        }
+    }
     atomic_write(path, &json)
 }
 
@@ -371,7 +398,7 @@ impl VaultManager {
         let temp_dir = vault_dir.join("tmp");
 
         let _ = create_private_dir(&data_dir);
-        let _ = create_private_dir(&temp_dir);
+        let _ = ensure_temp_dir_hidden(&temp_dir);
 
         let vm = VaultManager {
             entries: Vec::new(),
@@ -415,17 +442,88 @@ impl VaultManager {
     fn guard_path(&self) -> PathBuf {
         self.data_base.join("security.json")
     }
+}
+
+/// 派生防篡改 security.json 的 HMAC 密钥。生产环境下托管于系统钥匙串。
+fn guard_hmac_key(data_base: &Path) -> [u8; 32] {
+    #[cfg(not(test))]
+    {
+        if let Ok(key) = keychain::load_or_create_guard_hmac_key() {
+            return key;
+        }
+    }
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"filelocker_guard_hmac_salt_v1:");
+    hasher.update(data_base.to_string_lossy().as_bytes());
+    hasher.finalize().into()
+}
+
+impl VaultManager {
 
     fn load_guard(&self) -> GuardState {
-        fs::read(self.guard_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<GuardFile>(&b).ok())
-            .and_then(|f| f.vaults.get(&self.current_vault_id).cloned())
-            .unwrap_or_default()
+        let now = Utc::now().timestamp();
+        let key = guard_hmac_key(&self.data_base);
+
+        let state_from_file = if let Ok(bytes) = fs::read(self.guard_path()) {
+            if let Ok(f) = serde_json::from_slice::<GuardFile>(&bytes) {
+                let valid = if let Some(ref sig_b64) = f.hmac {
+                    if let Ok(sig_bytes) = STANDARD.decode(sig_b64.trim()) {
+                        if sig_bytes.len() == 32 {
+                            let mut exp = [0u8; 32];
+                            exp.copy_from_slice(&sig_bytes);
+                            let vaults_bytes = serde_json::to_vec(&f.vaults).unwrap_or_default();
+                            crypto::verify_hmac_sha256(&key, &vaults_bytes, &exp)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    // 向后兼容：旧版 security.json 没有 hmac，允许首次加载
+                    true
+                };
+
+                if !valid {
+                    // ⚠️ 检测到本地恶意篡改！HMAC 不匹配
+                    // 实施惩罚性冷却 300 秒，禁止利用篡改重置计数
+                    let mut penalty = GuardState::default();
+                    penalty.failed_attempts = 10;
+                    penalty.lockout_until = Some(now + 300);
+                    return penalty;
+                }
+
+                f.vaults.get(&self.current_vault_id).cloned().unwrap_or_default()
+            } else {
+                GuardState::default()
+            }
+        } else {
+            GuardState::default()
+        };
+
+        // 双锚点校验：检查钥匙串中的外部锁定锚点（防直接删除 security.json 绕过）
+        #[cfg(not(test))]
+        {
+            if let Some(anchor) = keychain::load_lockout_anchor(&self.current_vault_id) {
+                if anchor > now {
+                    // 钥匙串中仍处于锁定冷却期，但本地文件无锁定或已被清除
+                    if state_from_file.lockout_until.map(|u| u < anchor).unwrap_or(true) {
+                        let mut enforced = state_from_file;
+                        enforced.failed_attempts = enforced.failed_attempts.max(3);
+                        enforced.lockout_until = Some(anchor);
+                        return enforced;
+                    }
+                }
+            }
+        }
+
+        state_from_file
     }
 
-    /// 把当前内存中的防爆破计数写回 security.json（按保险箱 id 隔离）。
+    /// 把当前内存中的防爆破计数写回 security.json（按保险箱 id 隔离，HMAC 签名防篡改）。
     fn persist_guard(&self) {
+        let key = guard_hmac_key(&self.data_base);
         let mut file = fs::read(self.guard_path())
             .ok()
             .and_then(|b| serde_json::from_slice::<GuardFile>(&b).ok())
@@ -439,8 +537,22 @@ impl VaultManager {
                 recovery_lockout_until: self.recovery_lockout_until,
             },
         );
+        let vaults_bytes = serde_json::to_vec(&file.vaults).unwrap_or_default();
+        let mac = crypto::compute_hmac_sha256(&key, &vaults_bytes);
+        file.hmac = Some(STANDARD.encode(mac));
         if let Ok(bytes) = serde_json::to_vec(&file) {
             let _ = atomic_write(&self.guard_path(), &bytes);
+        }
+
+        // 双锚点同步到钥匙串：如果处于锁定状态，备份锁定时间戳；解除后清除
+        #[cfg(not(test))]
+        {
+            let active = self.lockout_until.into_iter().chain(self.recovery_lockout_until).max();
+            if let Some(until) = active {
+                let _ = keychain::store_lockout_anchor(&self.current_vault_id, until);
+            } else {
+                keychain::clear_lockout_anchor(&self.current_vault_id);
+            }
         }
     }
 
@@ -550,6 +662,7 @@ impl VaultManager {
             recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
             recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
             recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            device_wrap: None,
         };
         let keyring_json =
             serde_json::to_vec(&keyring).map_err(|e| format!("序列化 keyring 失败: {e}"))?;
@@ -569,9 +682,9 @@ impl VaultManager {
         self.save_index()?;
 
         if remember {
-            let _ = keychain::save_password(&self.current_vault_id, password);
+            let _ = self.remember_device_credentials(&master_key);
         } else {
-            let _ = keychain::delete_password(&self.current_vault_id);
+            self.forget_device_credentials();
         }
 
         Ok(recovery_code)
@@ -636,9 +749,9 @@ impl VaultManager {
         self.touch();
 
         if remember {
-            let _ = keychain::save_password(&self.current_vault_id, password);
+            let _ = self.remember_device_credentials(&master_key);
         } else {
-            let _ = keychain::delete_password(&self.current_vault_id);
+            self.forget_device_credentials();
         }
         Ok(self.entries.clone())
     }
@@ -810,6 +923,7 @@ impl VaultManager {
             recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
             recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
             recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            device_wrap: None,
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -824,17 +938,107 @@ impl VaultManager {
         let _ = self.clear_temp();
     }
 
+    /// 为当前保险箱生成高熵随机设备密钥（32 字节），加密包装主密钥为 device_wrap 写入 keyring.json，
+    /// 并在系统钥匙串中仅存储设备密钥。系统钥匙串中绝不存放用户明文主密码！
+    fn remember_device_credentials(&self, master_key: &[u8; 32]) -> Result<(), String> {
+        let mut dev_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut dev_key);
+        let wrap = crypto::encrypt(master_key, &dev_key)?;
+
+        if self.keyring_path().exists() {
+            let bytes = fs::read(self.keyring_path())
+                .map_err(|e| format!("读取 keyring 失败: {e}"))?;
+            let mut keyring: Keyring = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("解析 keyring 失败: {e}"))?;
+            keyring.device_wrap = Some(wrap);
+            let updated = serde_json::to_vec(&keyring)
+                .map_err(|e| format!("序列化 keyring 失败: {e}"))?;
+            atomic_write(&self.keyring_path(), &updated)?;
+        }
+
+        keychain::save_device_key(&self.current_vault_id, &dev_key)?;
+        // 彻底清除旧版本遗留的明文密码凭据
+        let _ = keychain::delete_password(&self.current_vault_id);
+        crypto::zeroize_slice(&mut dev_key);
+        Ok(())
+    }
+
+    /// 清除设备记住的凭据（钥匙串与 keyring 包装）
+    fn forget_device_credentials(&self) {
+        let _ = keychain::delete_device_key(&self.current_vault_id);
+        let _ = keychain::delete_password(&self.current_vault_id);
+        if self.keyring_path().exists() {
+            if let Ok(bytes) = fs::read(self.keyring_path()) {
+                if let Ok(mut keyring) = serde_json::from_slice::<Keyring>(&bytes) {
+                    if keyring.device_wrap.is_some() {
+                        keyring.device_wrap = None;
+                        if let Ok(updated) = serde_json::to_vec(&keyring) {
+                            let _ = atomic_write(&self.keyring_path(), &updated);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn has_saved_password(&self) -> bool {
+        if keychain::has_device_key(&self.current_vault_id) {
+            if let Ok(bytes) = fs::read(self.keyring_path()) {
+                if let Ok(keyring) = serde_json::from_slice::<Keyring>(&bytes) {
+                    if keyring.device_wrap.is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
         keychain::has_saved_password(&self.current_vault_id)
     }
 
-    /// 使用系统钥匙串中已记住的密码解锁。
+    /// 使用系统钥匙串中已记住的凭据免密解锁。
     ///
-    /// 注意：这不是生物识别。凭据以明文密码形式存放在系统钥匙串中，
-    /// 能否免输入读取由系统钥匙串自身的访问控制决定。
+    /// 零明文安全架构：优先使用保存在钥匙串中的设备密钥解密 keyring.device_wrap；
+    /// 向后兼容：兼容旧版本存储的明文密码，在首次解锁成功后自动升级为设备密钥并删除明文密码。
     pub fn unlock_with_keychain(&mut self) -> Result<Vec<VaultEntry>, String> {
+        // 1. 优先尝试高安全的设备密钥通道（零明文暴露）
+        if let Ok(dev_key) = keychain::load_device_key(&self.current_vault_id) {
+            if self.keyring_path().exists() {
+                let bytes = fs::read(self.keyring_path())
+                    .map_err(|e| format!("读取 keyring 失败: {e}"))?;
+                let keyring: Keyring = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("解析 keyring 失败: {e}"))?;
+                if let Some(ref wrap) = keyring.device_wrap {
+                    let mk_bytes = crypto::decrypt(wrap, &dev_key)?;
+                    if mk_bytes.len() != 32 {
+                        return Err("设备包装密钥长度无效".into());
+                    }
+                    let mut mk = [0u8; 32];
+                    mk.copy_from_slice(&mk_bytes);
+
+                    self.entries = self.load_index_with_key(&mk)?;
+                    self.master_key = Some(crypto::ProtectedMasterKey::new(mk));
+                    self.is_unlocked = true;
+                    self.failed_attempts = 0;
+                    self.lockout_until = None;
+                    self.recovery_failed_attempts = 0;
+                    self.recovery_lockout_until = None;
+                    self.persist_guard();
+                    self.touch();
+                    return Ok(self.entries.clone());
+                }
+            }
+        }
+
+        // 2. 向后兼容：旧版本遗留在钥匙串中的明文密码
         let pwd = keychain::load_password(&self.current_vault_id)?;
-        self.unlock(&pwd, false)
+        let entries = self.unlock(&pwd, false)?;
+
+        // 解锁成功后执行单向静默升级：生成设备密钥，替代钥匙串中的明文密码
+        if let Some(ref protected_mk) = self.master_key {
+            let mk = **protected_mk;
+            let _ = self.remember_device_credentials(&mk);
+        }
+
+        Ok(entries)
     }
 
     pub fn list_entries(&self) -> Result<Vec<VaultEntry>, String> {
@@ -931,7 +1135,7 @@ impl VaultManager {
         self.temp_dir = self.vault_dir.join("tmp");
 
         let _ = create_private_dir(&self.data_dir);
-        let _ = create_private_dir(&self.temp_dir);
+        let _ = ensure_temp_dir_hidden(&self.temp_dir);
         let _ = self.clear_temp();
 
         // 切换后以目标保险箱的落盘状态刷新防爆破计数
@@ -1033,7 +1237,9 @@ impl VaultManager {
             let _ = fs::remove_dir_all(&target_vdir);
         }
         let _ = keychain::delete_password(&removed.id);
+        let _ = keychain::delete_device_key(&removed.id);
         let _ = keychain::delete_index_generation(&removed.id);
+        keychain::clear_lockout_anchor(&removed.id);
 
         save_vault_profiles(&self.data_base, &profiles)?;
 
@@ -1310,6 +1516,153 @@ impl VaultManager {
         Ok(final_dir)
     }
 
+    /// 内存无痕预览：针对常见图片、文本、PDF 等在 RAM 中直接解密，
+    /// 0 字节写入磁盘，彻底避免外部 App 缓存、系统 Spotlight 索引与物理磁盘残留。
+    pub fn read_entry_preview(&self, id: &str) -> Result<crate::models::EntryPreviewData, String> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+            .ok_or_else(|| "条目不存在".to_string())?;
+        let mk = self.require_unlocked()?;
+        let blob_path = self.data_dir.join(&entry.cipher_path);
+
+        if entry.kind == "folder" {
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "folder".to_string(),
+                mime_type: "application/x-directory".to_string(),
+                data_base64: None,
+                text_content: None,
+                size: entry.size,
+            });
+        }
+
+        let name_lower = entry.name.to_lowercase();
+        let ext = Path::new(&name_lower)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let is_image = matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico");
+        let is_text = matches!(
+            ext,
+            "txt" | "md" | "markdown" | "json" | "js" | "jsx" | "ts" | "tsx" | "rs" | "py" | "c"
+                | "cpp" | "h" | "hpp" | "html" | "htm" | "css" | "scss" | "log" | "csv" | "xml"
+                | "toml" | "yaml" | "yml" | "ini" | "sh" | "bash" | "zsh" | "sql" | "env" | "gitignore"
+        );
+        let is_pdf = ext == "pdf";
+        let is_audio = matches!(ext, "mp3" | "wav" | "ogg" | "m4a" | "aac" | "flac");
+        let is_video = matches!(ext, "mp4" | "webm");
+
+        let max_text_size = 5 * 1024 * 1024; // 5 MB
+        let max_media_size = 30 * 1024 * 1024; // 30 MB
+
+        if is_image && entry.size <= max_media_size {
+            let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let mime = match ext {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "svg" => "image/svg+xml",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                "ico" => "image/x-icon",
+                _ => "image/png",
+            };
+            let b64 = STANDARD.encode(&data);
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "image".to_string(),
+                mime_type: mime.to_string(),
+                data_base64: Some(b64),
+                text_content: None,
+                size: entry.size,
+            });
+        }
+
+        if is_text && entry.size <= max_text_size {
+            let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let text = String::from_utf8_lossy(&data).to_string();
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "text".to_string(),
+                mime_type: "text/plain".to_string(),
+                data_base64: None,
+                text_content: Some(text),
+                size: entry.size,
+            });
+        }
+
+        if is_pdf && entry.size <= max_media_size {
+            let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let b64 = STANDARD.encode(&data);
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                data_base64: Some(b64),
+                text_content: None,
+                size: entry.size,
+            });
+        }
+
+        if is_audio && entry.size <= max_media_size {
+            let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let mime = match ext {
+                "mp3" => "audio/mpeg",
+                "wav" => "audio/wav",
+                "ogg" => "audio/ogg",
+                "m4a" => "audio/mp4",
+                _ => "audio/mpeg",
+            };
+            let b64 = STANDARD.encode(&data);
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "audio".to_string(),
+                mime_type: mime.to_string(),
+                data_base64: Some(b64),
+                text_content: None,
+                size: entry.size,
+            });
+        }
+
+        if is_video && entry.size <= max_media_size {
+            let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let mime = match ext {
+                "mp4" => "video/mp4",
+                "webm" => "video/webm",
+                _ => "video/mp4",
+            };
+            let b64 = STANDARD.encode(&data);
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "video".to_string(),
+                mime_type: mime.to_string(),
+                data_base64: Some(b64),
+                text_content: None,
+                size: entry.size,
+            });
+        }
+
+        Ok(crate::models::EntryPreviewData {
+            id: entry.id,
+            name: entry.name,
+            kind: "unsupported".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            data_base64: None,
+            text_content: None,
+            size: entry.size,
+        })
+    }
+
     pub fn open_entry(&self, id: &str) -> Result<(), String> {
         let entry = self
             .entries
@@ -1319,12 +1672,12 @@ impl VaultManager {
             .ok_or_else(|| "条目不存在".to_string())?;
         let mk = self.require_unlocked()?;
         let blob_path = self.data_dir.join(&entry.cipher_path);
-        create_private_dir(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+        ensure_temp_dir_hidden(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
         let target = if entry.kind == "folder" {
             let data = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
             let work = self.temp_dir.join(Uuid::new_v4().to_string());
-            create_private_dir(&work).map_err(|e| format!("创建临时目录失败: {e}"))?;
+            ensure_temp_dir_hidden(&work).map_err(|e| format!("创建临时目录失败: {e}"))?;
             match Self::extract_folder_to(&data, &entry.name, &work) {
                 Ok(dir) => dir,
                 Err(e) => {
@@ -1510,9 +1863,10 @@ impl VaultManager {
         }
     }
 
-    /// 一键清除当前保险箱已保存在系统钥匙串中的密码
+    /// 一键清除当前保险箱已保存在系统钥匙串中的凭据
     pub fn forget_saved_password(&mut self) -> Result<(), String> {
-        keychain::delete_password(&self.current_vault_id)
+        self.forget_device_credentials();
+        Ok(())
     }
 
     pub fn change_password(&mut self, old: &str, new: &str) -> Result<String, String> {
@@ -1546,8 +1900,8 @@ impl VaultManager {
 
         let new_recovery = crypto::generate_recovery_code();
         self.rewrite_keyring(&mk, new, &new_recovery)?;
-        if keychain::has_saved_password(&self.current_vault_id) {
-            let _ = keychain::save_password(&self.current_vault_id, new);
+        if self.has_saved_password() {
+            let _ = self.remember_device_credentials(&mk);
         }
         Ok(new_recovery)
     }
@@ -1604,8 +1958,8 @@ impl VaultManager {
         let _ = self.load_index_with_key(&mk)?;
         let new_recovery = crypto::generate_recovery_code();
         self.rewrite_keyring(&mk, new_password, &new_recovery)?;
-        if keychain::has_saved_password(&self.current_vault_id) {
-            let _ = keychain::save_password(&self.current_vault_id, new_password);
+        if self.has_saved_password() {
+            let _ = self.remember_device_credentials(&mk);
         }
         self.entries = self.load_index_with_key(&mk)?;
         self.master_key = Some(crypto::ProtectedMasterKey::new(mk));
@@ -1658,6 +2012,7 @@ impl VaultManager {
             recovery_kdf_type: Some(crypto::KDF_TYPE_ARGON2ID.to_string()),
             recovery_memory_kib: Some(crypto::ARGON2_DEFAULT_MEMORY_KIB),
             recovery_parallelism: Some(crypto::ARGON2_DEFAULT_PARALLELISM),
+            device_wrap: None,
         };
         let bytes = serde_json::to_vec(&keyring).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write(&self.keyring_path(), &bytes)?;
@@ -1674,7 +2029,7 @@ impl VaultManager {
             .ok_or_else(|| "条目不存在".to_string())?;
         let mk = self.require_unlocked()?;
         let blob_path = self.data_dir.join(&entry.cipher_path);
-        create_private_dir(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+        ensure_temp_dir_hidden(&self.temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
         let name = if entry.kind == "folder" {
             format!("{}.zip", entry.name)
@@ -1815,14 +2170,16 @@ impl VaultManager {
                 .map_err(|e| format!("删除 vault 目录失败: {e}"))?;
         }
         let _ = keychain::delete_password(&self.current_vault_id);
+        let _ = keychain::delete_device_key(&self.current_vault_id);
         // 与 delete_vault 一致：清空保险箱后同步移除索引代次锚点，
         // 否则下次新建同名保险箱会因锚点残留而误判「索引回滚」。
         let _ = keychain::delete_index_generation(&self.current_vault_id);
+        keychain::clear_lockout_anchor(&self.current_vault_id);
         self.master_key = None;
         self.entries.clear();
         self.is_unlocked = false;
         let _ = create_private_dir(&self.data_dir);
-        let _ = create_private_dir(&self.temp_dir);
+        let _ = ensure_temp_dir_hidden(&self.temp_dir);
         Ok(())
     }
 
@@ -2328,6 +2685,7 @@ mod tests {
             recovery_kdf_type: Some("pbkdf2".to_string()),
             recovery_memory_kib: None,
             recovery_parallelism: None,
+            device_wrap: None,
         };
         atomic_write(&vm.keyring_path(), &serde_json::to_vec(&legacy).unwrap()).unwrap();
 
@@ -2489,6 +2847,114 @@ mod tests {
                 format!("File payload data for index {i}").repeat(500)
             );
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_security_json_tamper_detection_and_penalty() {
+        let base = tmp_base("tamper_test");
+        let mut vm = make_test_vm(&base, "vault-tamper");
+        vm.set_password("MyStrongPass123!", false).unwrap();
+        vm.lock();
+
+        // 输错 3 次触发冷却
+        for _ in 0..3 {
+            let _ = vm.unlock("WrongPass123!", false);
+        }
+        assert!(vm.lockout_until.is_some());
+
+        // 模拟黑客本地手工篡改 security.json 试图清除冷却时间
+        let guard_file = vm.guard_path();
+        assert!(guard_file.exists());
+        let raw_json = fs::read_to_string(&guard_file).unwrap();
+        // 篡改计数为 0
+        let tampered_json = raw_json.replace("\"failed_attempts\":3", "\"failed_attempts\":0");
+        fs::write(&guard_file, tampered_json).unwrap();
+
+        // 重启实例：HMAC 校验应失败，并触发惩罚性防暴力破解冷却
+        let mut restarted = make_test_vm(&base, "vault-tamper");
+        let err = restarted.unlock("MyStrongPass123!", false).unwrap_err();
+        assert!(err.contains("安全保护中"), "篡改后应检测到异常并强制冷却，实际错误: {err}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_in_memory_preview_zero_disk() {
+        let base = tmp_base("in_memory_preview");
+        let mut vm = make_test_vm(&base, "vault-preview");
+        vm.set_password("MyStrongPass123!", false).unwrap();
+
+        let test_file = base.join("confidential_contract.txt");
+        let secret_text = "Highly confidential data: NDA-2026-X999";
+        fs::write(&test_file, secret_text).unwrap();
+
+        let added = vm.add_files(vec![test_file.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(added.len(), 1);
+        let entry_id = &added[0].id;
+
+        // 内存无痕预览
+        let preview = vm.read_entry_preview(entry_id).unwrap();
+        assert_eq!(preview.kind, "text");
+        assert_eq!(preview.text_content.unwrap(), secret_text);
+
+        // 验证 temp_dir 中没有任何临时明文文件产生（0 磁盘写入）
+        let temp_files: Vec<_> = fs::read_dir(&vm.temp_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != ".metadata_never_index")
+            .collect();
+        assert!(temp_files.is_empty(), "内存无痕预览绝不应在磁盘留下任何临时明文！");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_encrypted_metadata_json_compatibility_roundtrip() {
+        let base = tmp_base("meta_crypto");
+        fs::create_dir_all(&base).unwrap();
+        let meta_file = base.join("meta_test.json");
+
+        let sample_profiles = vec![
+            VaultProfile {
+                id: "v-secret-1".to_string(),
+                name: "绝密财务保险箱".to_string(),
+                created_at: 1700000000,
+            },
+            VaultProfile {
+                id: "v-secret-2".to_string(),
+                name: "个人隐私证件".to_string(),
+                created_at: 1700000100,
+            },
+        ];
+
+        // 1. 模拟旧版直接写入明文 JSON：load_meta_json 必须兼容成功读取
+        let plain_json = serde_json::to_vec(&sample_profiles).unwrap();
+        atomic_write(&meta_file, &plain_json).unwrap();
+        let loaded_plain: Vec<VaultProfile> = load_meta_json(&meta_file).unwrap();
+        assert_eq!(loaded_plain.len(), 2);
+        assert_eq!(loaded_plain[0].name, "绝密财务保险箱");
+
+        // 2. 模拟使用 AES-256-GCM 加密并附带 META_MAGIC
+        let test_key = [42u8; 32];
+        let enc = crypto::encrypt(&plain_json, &test_key).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(META_MAGIC);
+        out.extend_from_slice(&enc);
+        atomic_write(&meta_file, &out).unwrap();
+
+        // 验证物理磁盘上的内容不是明文 JSON（开头是魔数，且包含密文）
+        let disk_bytes = fs::read(&meta_file).unwrap();
+        assert!(disk_bytes.starts_with(META_MAGIC));
+        assert!(serde_json::from_slice::<Vec<VaultProfile>>(&disk_bytes).is_err(), "落盘数据已被加密，绝不能以明文 JSON 直接反序列化！");
+
+        // 验证通过解密能完整还原数据
+        let cipher_payload = disk_bytes.strip_prefix(META_MAGIC).unwrap();
+        let decrypted = crypto::decrypt(cipher_payload, &test_key).unwrap();
+        let parsed: Vec<VaultProfile> = serde_json::from_slice(&decrypted).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].name, "个人隐私证件");
 
         let _ = fs::remove_dir_all(&base);
     }

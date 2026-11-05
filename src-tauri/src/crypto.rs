@@ -2,6 +2,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
@@ -139,7 +140,11 @@ impl Drop for ProtectedMasterKey {
 }
 
 /// 用 PBKDF2-HMAC-SHA256 从密码 + 盐派生 32 字节密钥（自定义迭代次数）。
-pub fn derive_key_password_with_iter(password: &str, salt: &[u8], iterations: u32) -> [u8; KEY_LEN] {
+pub fn derive_key_password_with_iter(
+    password: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; KEY_LEN] {
     let mut out = [0u8; KEY_LEN];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut out);
     out
@@ -249,6 +254,22 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
+/// 计算数据块的 HMAC-SHA256 签名，用于防篡改校验。
+pub fn compute_hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC 支持任意长度密钥");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+/// 恒定时间校验 HMAC-SHA256 签名，避免计时侧信道攻击。
+pub fn verify_hmac_sha256(key: &[u8], data: &[u8], expected: &[u8; 32]) -> bool {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC 支持任意长度密钥");
+    mac.update(data);
+    mac.verify_slice(expected).is_ok()
+}
+
 /// 安全擦除内存字节，使用 volatile write + 编译器屏障防止被编译器死代码消除优化掉。
 pub fn zeroize_slice(buf: &mut [u8]) {
     for b in buf.iter_mut() {
@@ -279,9 +300,7 @@ fn chunk_aad(chunk_size: u32, chunk_index: u64, is_last: bool) -> [u8; 13] {
 
 /// 从 16 字节头部解析并校验 v2 分块明文大小。
 fn parse_v2_chunk_size(header: &[u8; 16]) -> Result<u32, String> {
-    let chunk_size = u32::from_be_bytes(
-        header[12..16].try_into().expect("头部长度固定为 16"),
-    );
+    let chunk_size = u32::from_be_bytes(header[12..16].try_into().expect("头部长度固定为 16"));
     if chunk_size == 0 || chunk_size as usize > MAX_CHUNK_SIZE {
         return Err("分块大小头部无效".into());
     }
@@ -352,7 +371,13 @@ fn decrypt_chunk(
 ) -> Result<Vec<u8>, String> {
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher
-        .decrypt(nonce, Payload { msg: cipher_buf, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: cipher_buf,
+                aad,
+            },
+        )
         .map_err(|_| "分块解密失败，密钥错误或数据损坏".to_string())
 }
 
@@ -406,7 +431,9 @@ where
     let mut writer = File::create(dst).map_err(|e| format!("创建目标密文文件失败: {e}"))?;
 
     let chunk_size = DEFAULT_CHUNK_SIZE;
-    writer.write_all(CHUNK_MAGIC).map_err(|e| format!("写入头部失败: {e}"))?;
+    writer
+        .write_all(CHUNK_MAGIC)
+        .map_err(|e| format!("写入头部失败: {e}"))?;
     writer
         .write_all(&(chunk_size as u32).to_be_bytes())
         .map_err(|e| format!("写入分块大小失败: {e}"))?;
@@ -415,6 +442,10 @@ where
     // 多读 1 字节用于判断当前块之后是否还有数据，从而在不依赖文件元数据的前提下判定 is_last。
     let mut buffer = vec![0u8; chunk_size + 1];
     let mut carry: Option<u8> = None;
+    // 为当前文件流生成 4 字节（32-bit）高熵随机前缀，结合递增序号杜绝分块间 Nonce 碰撞
+    let mut file_nonce_salt = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut file_nonce_salt);
+
     let mut chunk_index: u64 = 0;
     let mut total_plain_bytes: u64 = 0;
 
@@ -441,8 +472,11 @@ where
         }
 
         let aad = chunk_aad(chunk_size as u32, chunk_index, is_last);
+        // 96-bit Nonce：4 字节随机盐 + 8 字节大端分块序号。
+        // 依据 NIST SP 800-38D 标准，递增序号杜绝了同文件内的随机数生日碰撞（Birthday Collision）隐患。
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        nonce_bytes[..4].copy_from_slice(&file_nonce_salt);
+        nonce_bytes[4..].copy_from_slice(&chunk_index.to_be_bytes());
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(
@@ -477,7 +511,9 @@ where
         }
     }
 
-    writer.flush().map_err(|e| format!("刷新目标文件失败: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("刷新目标文件失败: {e}"))?;
     Ok(total_plain_bytes)
 }
 
@@ -499,7 +535,11 @@ fn parse_chunk_header(header: &[u8; 16], file_len: u64) -> Result<(bool, usize),
 
 /// 超大文件流式解密：将 cipher_path 解密流式写入 dst。自动兼容 v2/v1 分块流与历史老版单 blob 格式。
 /// 失败时删除已写出的半成品文件，避免残留不完整明文。
-pub fn decrypt_file_stream(cipher_path: &Path, dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
+pub fn decrypt_file_stream(
+    cipher_path: &Path,
+    dst: &Path,
+    key: &[u8; KEY_LEN],
+) -> Result<u64, String> {
     decrypt_file_stream_with_progress(cipher_path, dst, key, |_, _| {})
 }
 
@@ -537,7 +577,9 @@ where
     let file_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
     if file_len >= 16 {
         let mut header = [0u8; 16];
-        reader.read_exact(&mut header).map_err(|e| format!("读取头部失败: {e}"))?;
+        reader
+            .read_exact(&mut header)
+            .map_err(|e| format!("读取头部失败: {e}"))?;
         if &header[..12] == CHUNK_MAGIC || &header[..12] == CHUNK_MAGIC_V1 {
             let (is_v2, max_chunk_len) = parse_chunk_header(&header, file_len)?;
             let chunk_size = if is_v2 {
@@ -545,7 +587,8 @@ where
             } else {
                 0
             };
-            let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("密钥初始化失败: {e}"))?;
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|e| format!("密钥初始化失败: {e}"))?;
             let mut total_plain_bytes: u64 = 0;
             let mut chunk_index: u64 = 0;
 
@@ -577,18 +620,28 @@ where
             }
 
             ensure_stream_end(&mut reader)?;
-            writer.flush().map_err(|e| format!("刷新解密文件失败: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("刷新解密文件失败: {e}"))?;
             return Ok(total_plain_bytes);
         }
-        reader.seek(SeekFrom::Start(0)).map_err(|e| format!("回退文件流失败: {e}"))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("回退文件流失败: {e}"))?;
     }
 
     // 传统单 blob 解密（向下兼容历史老文件）
     let mut cipher_all = Vec::new();
-    reader.read_to_end(&mut cipher_all).map_err(|e| format!("读取旧密文失败: {e}"))?;
+    reader
+        .read_to_end(&mut cipher_all)
+        .map_err(|e| format!("读取旧密文失败: {e}"))?;
     let plain = decrypt(&cipher_all, key)?;
-    writer.write_all(&plain).map_err(|e| format!("写入解密文件失败: {e}"))?;
-    writer.flush().map_err(|e| format!("刷新解密文件失败: {e}"))?;
+    writer
+        .write_all(&plain)
+        .map_err(|e| format!("写入解密文件失败: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("刷新解密文件失败: {e}"))?;
     on_progress(plain.len() as u64, file_len);
     Ok(plain.len() as u64)
 }
@@ -599,7 +652,9 @@ pub fn decrypt_file_to_bytes(cipher_path: &Path, key: &[u8; KEY_LEN]) -> Result<
     let file_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
     if file_len >= 16 {
         let mut header = [0u8; 16];
-        reader.read_exact(&mut header).map_err(|e| format!("读取头部失败: {e}"))?;
+        reader
+            .read_exact(&mut header)
+            .map_err(|e| format!("读取头部失败: {e}"))?;
         if &header[..12] == CHUNK_MAGIC || &header[..12] == CHUNK_MAGIC_V1 {
             let (is_v2, max_chunk_len) = parse_chunk_header(&header, file_len)?;
             let chunk_size = if is_v2 {
@@ -607,7 +662,8 @@ pub fn decrypt_file_to_bytes(cipher_path: &Path, key: &[u8; KEY_LEN]) -> Result<
             } else {
                 0
             };
-            let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("密钥初始化失败: {e}"))?;
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|e| format!("密钥初始化失败: {e}"))?;
             let mut out = Vec::new();
             let mut chunk_index: u64 = 0;
 
@@ -636,11 +692,15 @@ pub fn decrypt_file_to_bytes(cipher_path: &Path, key: &[u8; KEY_LEN]) -> Result<
             ensure_stream_end(&mut reader)?;
             return Ok(out);
         }
-        reader.seek(SeekFrom::Start(0)).map_err(|e| format!("回退文件流失败: {e}"))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("回退文件流失败: {e}"))?;
     }
 
     let mut cipher_all = Vec::new();
-    reader.read_to_end(&mut cipher_all).map_err(|e| format!("读取旧密文失败: {e}"))?;
+    reader
+        .read_to_end(&mut cipher_all)
+        .map_err(|e| format!("读取旧密文失败: {e}"))?;
     decrypt(&cipher_all, key)
 }
 
@@ -847,14 +907,9 @@ mod tests {
 
         let code = "ABCD-EFGH-JKLM-NPQR-STVW-XYZA";
         let rkey1 = derive_key_recovery_argon2id(code, &salt, 1024, 2, 1).unwrap();
-        let rkey2 = derive_key_recovery_argon2id(
-            "abcd efgh jklm npqr stvw xyza",
-            &salt,
-            1024,
-            2,
-            1,
-        )
-        .unwrap();
+        let rkey2 =
+            derive_key_recovery_argon2id("abcd efgh jklm npqr stvw xyza", &salt, 1024, 2, 1)
+                .unwrap();
         assert_eq!(rkey1, rkey2);
     }
 
@@ -904,5 +959,21 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&enc);
         let _ = std::fs::remove_file(&dec);
+    }
+
+    #[test]
+    fn test_hmac_sha256_verification() {
+        let key = b"test_secret_key_12345";
+        let data = b"filelocker security guard state data";
+        let mac = compute_hmac_sha256(key, data);
+        assert!(verify_hmac_sha256(key, data, &mac));
+
+        // 篡改数据应校验失败
+        let corrupted_data = b"filelocker security guard state data corrupted";
+        assert!(!verify_hmac_sha256(key, corrupted_data, &mac));
+
+        // 错误密钥应校验失败
+        let wrong_key = b"wrong_secret_key_99999";
+        assert!(!verify_hmac_sha256(wrong_key, data, &mac));
     }
 }

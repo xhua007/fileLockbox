@@ -969,7 +969,7 @@ function renderFileItem(entry) {
   }, emoji));
   mkBtn('✏️', '重命名', () => showRenameModal(entry));
   mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
-  mkBtn('👁', '打开', () => openEntry(entry.id));
+  mkBtn('👁', '无痕预览', () => previewOrOpenEntry(entry));
   mkBtn('⤴', '导出', () => exportEntry(entry));
   mkBtn('🗑', '删除', () => deleteEntry(entry), true);
   row.appendChild(actions);
@@ -987,7 +987,7 @@ function renderFileItem(entry) {
   });
   row.addEventListener('dblclick', e => {
     if (e.target.closest('.file-actions') || e.target.closest('.file-checkbox')) return;
-    openEntry(entry.id);
+    previewOrOpenEntry(entry);
   });
   row.addEventListener('contextmenu', e => {
     e.preventDefault();
@@ -1061,6 +1061,71 @@ function showRenameModal(entry) {
       nameInput.select();
     }
   }, 50);
+}
+
+async function previewOrOpenEntry(entry) {
+  if (entry.kind === 'folder') {
+    return openEntry(entry.id);
+  }
+  try {
+    const previewData = await invoke('read_entry_preview', { id: entry.id });
+    if (previewData.kind === 'unsupported' || previewData.kind === 'folder') {
+      return openEntry(entry.id);
+    }
+    showPreviewModal(previewData, entry);
+  } catch (e) {
+    showError('预览失败: ' + e);
+  }
+}
+
+function showPreviewModal(previewData, entry) {
+  let bodyContent;
+  if (previewData.kind === 'image') {
+    const src = `data:${previewData.mime_type};base64,${previewData.data_base64}`;
+    bodyContent = el('img', { class: 'preview-img', src, alt: previewData.name });
+  } else if (previewData.kind === 'text') {
+    bodyContent = el('pre', { class: 'preview-text' }, previewData.text_content || '');
+  } else if (previewData.kind === 'pdf') {
+    const src = `data:application/pdf;base64,${previewData.data_base64}`;
+    bodyContent = el('iframe', { class: 'preview-iframe', src });
+  } else if (previewData.kind === 'audio') {
+    const src = `data:${previewData.mime_type};base64,${previewData.data_base64}`;
+    bodyContent = el('audio', { class: 'preview-audio', controls: true, autoplay: false, src });
+  } else if (previewData.kind === 'video') {
+    const src = `data:${previewData.mime_type};base64,${previewData.data_base64}`;
+    bodyContent = el('video', { class: 'preview-video', controls: true, autoplay: false, src });
+  } else {
+    bodyContent = el('div', { style: 'color: var(--text-secondary); text-align: center;' }, '暂不支持该格式的内存渲染预览');
+  }
+
+  const modal = el('div', { class: 'preview-modal' }, [
+    el('div', { class: 'preview-header' }, [
+      el('div', { class: 'preview-title-box' }, [
+        el('span', { class: 'preview-title', title: previewData.name }, previewData.name),
+        el('span', { class: 'preview-badge' }, '内存无痕预览 (0 磁盘写入)'),
+      ]),
+      el('div', { class: 'preview-actions' }, [
+        el('button', {
+          class: 'btn btn-ghost',
+          style: 'padding: 6px 12px; font-size: 12px;',
+          title: '在系统外部关联应用中打开此文件',
+          onclick: () => {
+            closeModal();
+            openEntry(entry.id);
+          }
+        }, '在系统应用中打开…'),
+        el('button', {
+          class: 'btn btn-ghost',
+          style: 'padding: 6px 10px; font-size: 14px; line-height: 1;',
+          title: '关闭 (Esc)',
+          onclick: closeModal
+        }, '✕')
+      ])
+    ]),
+    el('div', { class: 'preview-body' }, [bodyContent])
+  ]);
+
+  showModal(modal);
 }
 
 async function openEntry(id) {
@@ -1279,7 +1344,8 @@ document.addEventListener('click', e => {
     if (!id) return;
     const entry = state.entries.find(x => x.id === id);
     if (!entry) return;
-    if (action === 'open') openEntry(id);
+    if (action === 'preview') previewOrOpenEntry(entry);
+    else if (action === 'open') openEntry(id);
     else if (action === 'rename') showRenameModal(entry);
     else if (action === 'export') exportEntry(entry);
     else if (action === 'restore') restoreEntry(id);
