@@ -581,6 +581,38 @@
   }
   .file-action-btn:hover { background: var(--border-light); color: var(--text); }
   .file-action-btn.danger:hover { color: var(--danger); }
+  .file-action-btn.btn-finish-edit {
+    width: auto;
+    padding: 0 8px;
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+  }
+  .file-action-btn.btn-finish-edit:hover {
+    background: #10b981;
+    color: #ffffff;
+  }
+
+  .badge-editing {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    border-radius: 999px;
+    padding: 1px 8px;
+    margin-left: 8px;
+    vertical-align: middle;
+    animation: badge-pulse 2s infinite;
+  }
+  @keyframes badge-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.65; transform: scale(0.98); }
+  }
 
   .toast-container {
     position: fixed;
@@ -967,6 +999,7 @@
 
 <div class="context-menu" id="contextMenu">
   <div class="context-menu-item" data-action="preview">👁 无痕预览</div>
+  <div class="context-menu-item" data-action="edit">⚡ 原地编辑（自动同步）</div>
   <div class="context-menu-item" data-action="open">📂 在系统应用中打开…</div>
   <div class="context-menu-item" data-action="rename">✏️ 重命名…</div>
   <div class="context-menu-item" data-action="export">⤴ 导出</div>
@@ -977,7 +1010,10 @@
 
 <div class="dropdown-menu" id="gearMenu">
   <div class="dropdown-item" data-action="changepw">🔒 修改密码…</div>
-  <div class="dropdown-item" data-action="toggle-privacy-blur" id="gearPrivacyBlurItem">🛡️ 窗口防窥保护：已开启</div>
+  <div class="dropdown-item" data-action="toggle-biometrics" id="gearBiometricsItem">👆 Touch ID 解锁：已开启</div>
+  <div class="dropdown-item" data-action="toggle-screen-shield" id="gearScreenShieldItem">🛡️ 录屏截屏防窥遮罩：已开启</div>
+  <div class="dropdown-item" data-action="toggle-shred-source" id="gearShredSourceItem">🔥 导入时物理粉碎原文件：已开启</div>
+  <div class="dropdown-item" data-action="toggle-privacy-blur" id="gearPrivacyBlurItem">👁️ 失去焦点防窥模糊：已开启</div>
   <div class="dropdown-item has-submenu" data-action="autolock">
     <span>⏱ 自动锁定</span>
     <span class="dropdown-submenu-indicator">◀</span>

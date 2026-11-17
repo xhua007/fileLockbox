@@ -1202,6 +1202,7 @@ dependencies = [
  "hmac",
  "keyring",
  "libc",
+ "objc",
  "pbkdf2",
  "rand",
  "serde",

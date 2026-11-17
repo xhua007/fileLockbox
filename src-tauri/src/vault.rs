@@ -1,3 +1,4 @@
+use crate::biometrics;
 use crate::crypto;
 use crate::fs as vfs;
 use crate::keychain;
@@ -15,6 +16,18 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 use zip::{write::FileOptions, CompressionMethod, ZipWriter};
+
+use crate::models::ActiveEditSession;
+
+#[derive(Clone, Debug)]
+pub struct ActiveEditTracking {
+    pub entry_id: String,
+    pub file_name: String,
+    pub temp_path: PathBuf,
+    pub opened_at: i64,
+    pub last_mtime: u64,
+    pub last_size: u64,
+}
 
 #[derive(Debug)]
 pub struct VaultManager {
@@ -37,6 +50,14 @@ pub struct VaultManager {
     /// 最近一次有效操作的时间戳（秒）。存放在 Cell 中以便 `&self` 方法也能刷新，
     /// 由 Rust 侧后台线程据此执行权威的空闲自动锁定。
     pub last_activity: Cell<i64>,
+    /// 导入文件后是否安全粉碎原文件（而非移入系统废纸篓保留明文）
+    pub shred_source: bool,
+    /// 窗口防截屏/防录屏遮罩保护开关
+    pub privacy_screen_protection: bool,
+    /// 是否启用 Touch ID / 生物识别快速解锁
+    pub biometrics_enabled: bool,
+    /// 当前正在原地编辑的文件跟踪会话（entry_id -> ActiveEditTracking）
+    pub active_edits: std::collections::HashMap<String, ActiveEditTracking>,
 }
 
 /// 防爆破状态：落盘保存，重启应用后仍然生效，避免「关掉再开」重置失败计数。
@@ -197,6 +218,9 @@ struct IndexData {
     #[serde(default)]
     generation: u64,
     entries: Vec<VaultEntry>,
+    /// 密码学随机长度混淆填充（64..256 字节），阻断根据密文尺寸推断条目数与文件名字长的侧信道分析
+    #[serde(default)]
+    padding: Option<Vec<u8>>,
 }
 
 /// 校验索引代次相对锚点没有倒退。
@@ -268,6 +292,21 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
         }
         let _ = fs::remove_file(&tmp_path);
         return Err(format!("原子重命名替换文件失败: {e}"));
+    }
+    Ok(())
+}
+
+fn atomic_replace(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Err(e) = fs::rename(src, dst) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = fs::remove_file(dst);
+            if fs::rename(src, dst).is_ok() {
+                return Ok(());
+            }
+        }
+        let _ = fs::remove_file(src);
+        return Err(format!("原子替换目标文件失败: {e}"));
     }
     Ok(())
 }
@@ -374,6 +413,18 @@ impl VaultManager {
             .as_ref()
             .and_then(|c| c.auto_lock_minutes)
             .unwrap_or(DEFAULT_AUTO_LOCK_MINUTES);
+        let shred_source = app_config
+            .as_ref()
+            .and_then(|c| c.shred_source_after_import)
+            .unwrap_or(true);
+        let privacy_screen_protection = app_config
+            .as_ref()
+            .and_then(|c| c.privacy_screen_protection)
+            .unwrap_or(false);
+        let biometrics_enabled = app_config
+            .as_ref()
+            .and_then(|c| c.biometrics_enabled)
+            .unwrap_or(true);
 
         let profiles = load_vault_profiles(&data_base);
         let target_vault_id = app_config
@@ -417,6 +468,10 @@ impl VaultManager {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source,
+            privacy_screen_protection,
+            biometrics_enabled,
+            active_edits: std::collections::HashMap::new(),
         };
 
         // 启动时主动清理上次异常断电或退出遗留的临时解密明文文件
@@ -460,7 +515,6 @@ fn guard_hmac_key(data_base: &Path) -> [u8; 32] {
 }
 
 impl VaultManager {
-
     fn load_guard(&self) -> GuardState {
         let now = Utc::now().timestamp();
         let key = guard_hmac_key(&self.data_base);
@@ -494,7 +548,10 @@ impl VaultManager {
                     return penalty;
                 }
 
-                f.vaults.get(&self.current_vault_id).cloned().unwrap_or_default()
+                f.vaults
+                    .get(&self.current_vault_id)
+                    .cloned()
+                    .unwrap_or_default()
             } else {
                 GuardState::default()
             }
@@ -508,7 +565,11 @@ impl VaultManager {
             if let Some(anchor) = keychain::load_lockout_anchor(&self.current_vault_id) {
                 if anchor > now {
                     // 钥匙串中仍处于锁定冷却期，但本地文件无锁定或已被清除
-                    if state_from_file.lockout_until.map(|u| u < anchor).unwrap_or(true) {
+                    if state_from_file
+                        .lockout_until
+                        .map(|u| u < anchor)
+                        .unwrap_or(true)
+                    {
                         let mut enforced = state_from_file;
                         enforced.failed_attempts = enforced.failed_attempts.max(3);
                         enforced.lockout_until = Some(anchor);
@@ -547,7 +608,11 @@ impl VaultManager {
         // 双锚点同步到钥匙串：如果处于锁定状态，备份锁定时间戳；解除后清除
         #[cfg(not(test))]
         {
-            let active = self.lockout_until.into_iter().chain(self.recovery_lockout_until).max();
+            let active = self
+                .lockout_until
+                .into_iter()
+                .chain(self.recovery_lockout_until)
+                .max();
             if let Some(until) = active {
                 let _ = keychain::store_lockout_anchor(&self.current_vault_id, until);
             } else {
@@ -620,9 +685,7 @@ impl VaultManager {
         create_private_dir(&self.data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
 
         // 随机主密钥
-        let master_key: [u8; 32] = crypto::random_bytes(32)
-            .try_into()
-            .expect("长度必为 32");
+        let master_key: [u8; 32] = crypto::random_bytes(32).try_into().expect("长度必为 32");
 
         // 密码盐 + KEK 包装（Argon2id）
         let password_salt = crypto::random_bytes(crypto::SALT_LEN);
@@ -702,7 +765,9 @@ impl VaultManager {
         if let Some(lockout) = self.lockout_until {
             if now < lockout {
                 let remaining = lockout - now;
-                return Err(format!("输错密码次数过多，安全保护中，请等待 {remaining} 秒后再试"));
+                return Err(format!(
+                    "输错密码次数过多，安全保护中，请等待 {remaining} 秒后再试"
+                ));
             } else {
                 self.lockout_until = None;
             }
@@ -738,7 +803,10 @@ impl VaultManager {
                     ));
                 } else {
                     let tries_left = 3 - self.failed_attempts;
-                    return Err(format!("密码错误！剩余 {} 次尝试后将触发安全冷却延迟", tries_left));
+                    return Err(format!(
+                        "密码错误！剩余 {} 次尝试后将触发安全冷却延迟",
+                        tries_left
+                    ));
                 }
             }
         };
@@ -760,8 +828,8 @@ impl VaultManager {
         let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
         let keyring_bytes =
             fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
-        let keyring: Keyring =
-            serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
+        let keyring: Keyring = serde_json::from_slice(&keyring_bytes)
+            .map_err(|e| format!("解析 keyring 失败: {e}"))?;
 
         let kdf_type = keyring
             .kdf_type
@@ -839,8 +907,8 @@ impl VaultManager {
     fn unwrap_with_recovery(&self, code: &str) -> Result<[u8; 32], String> {
         let keyring_bytes =
             fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
-        let keyring: Keyring =
-            serde_json::from_slice(&keyring_bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
+        let keyring: Keyring = serde_json::from_slice(&keyring_bytes)
+            .map_err(|e| format!("解析 keyring 失败: {e}"))?;
 
         let rec_kdf = keyring
             .recovery_kdf_type
@@ -882,12 +950,9 @@ impl VaultManager {
 
     /// 将旧版本保险箱升级为 keyring 体系。返回新生成的恢复码。
     #[allow(dead_code)]
-    fn upgrade_to_keyring(
-        &self,
-        master_key: &[u8; 32],
-        password: &str,
-    ) -> Result<String, String> {
-        let password_salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
+    fn upgrade_to_keyring(&self, master_key: &[u8; 32], password: &str) -> Result<String, String> {
+        let password_salt =
+            fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
         let mut password_kek = crypto::derive_key_argon2id(
             password,
             &password_salt,
@@ -935,6 +1000,7 @@ impl VaultManager {
         self.master_key = None;
         self.entries.clear();
         self.is_unlocked = false;
+        self.active_edits.clear();
         let _ = self.clear_temp();
     }
 
@@ -946,13 +1012,13 @@ impl VaultManager {
         let wrap = crypto::encrypt(master_key, &dev_key)?;
 
         if self.keyring_path().exists() {
-            let bytes = fs::read(self.keyring_path())
-                .map_err(|e| format!("读取 keyring 失败: {e}"))?;
-            let mut keyring: Keyring = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("解析 keyring 失败: {e}"))?;
+            let bytes =
+                fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
+            let mut keyring: Keyring =
+                serde_json::from_slice(&bytes).map_err(|e| format!("解析 keyring 失败: {e}"))?;
             keyring.device_wrap = Some(wrap);
-            let updated = serde_json::to_vec(&keyring)
-                .map_err(|e| format!("序列化 keyring 失败: {e}"))?;
+            let updated =
+                serde_json::to_vec(&keyring).map_err(|e| format!("序列化 keyring 失败: {e}"))?;
             atomic_write(&self.keyring_path(), &updated)?;
         }
 
@@ -1002,8 +1068,8 @@ impl VaultManager {
         // 1. 优先尝试高安全的设备密钥通道（零明文暴露）
         if let Ok(dev_key) = keychain::load_device_key(&self.current_vault_id) {
             if self.keyring_path().exists() {
-                let bytes = fs::read(self.keyring_path())
-                    .map_err(|e| format!("读取 keyring 失败: {e}"))?;
+                let bytes =
+                    fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
                 let keyring: Keyring = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("解析 keyring 失败: {e}"))?;
                 if let Some(ref wrap) = keyring.device_wrap {
@@ -1194,7 +1260,10 @@ impl VaultManager {
             return Err("保险箱名称不能为空".into());
         }
         let mut profiles = load_vault_profiles(&self.data_base);
-        if profiles.iter().any(|p| p.id != vault_id && p.name == trimmed) {
+        if profiles
+            .iter()
+            .any(|p| p.id != vault_id && p.name == trimmed)
+        {
             return Err("已存在同名保险箱".into());
         }
 
@@ -1329,56 +1398,27 @@ impl VaultManager {
 
         std::thread::scope(|s| {
             for _ in 0..concurrency {
-                s.spawn(|| {
-                    loop {
-                        let item = {
-                            let mut lock = tasks.lock().unwrap();
-                            lock.pop()
-                        };
-                        let (idx, (p_str, p, name, is_dir)) = match item {
-                            Some(val) => val,
-                            None => break,
-                        };
+                s.spawn(|| loop {
+                    let item = {
+                        let mut lock = tasks.lock().unwrap();
+                        lock.pop()
+                    };
+                    let (idx, (p_str, p, name, is_dir)) = match item {
+                        Some(val) => val,
+                        None => break,
+                    };
 
-                        let blob_name = format!("{}.bin", Uuid::new_v4());
-                        let blob_path = data_dir.join(&blob_name);
+                    let blob_name = format!("{}.bin", Uuid::new_v4());
+                    let blob_path = data_dir.join(&blob_name);
 
-                        let res = if is_dir {
-                            let zip_path = temp_dir.join(format!("zip-{}.tmp", Uuid::new_v4()));
-                            if let Err(e) = zip_directory_to_file(&p, &zip_path) {
-                                let _ = fs::remove_file(&zip_path);
-                                Err(e)
-                            } else {
-                                let enc_res = crypto::encrypt_file_stream_with_progress(
-                                    &zip_path,
-                                    &blob_path,
-                                    &mk_bytes,
-                                    |done, total| {
-                                        if let Ok(mut cb) = on_progress_mutex.lock() {
-                                            let percent = if total > 0 {
-                                                (done as f32 / total as f32) * 100.0
-                                            } else {
-                                                100.0
-                                            };
-                                            cb(crate::models::OperationProgress {
-                                                stage: "encrypt".to_string(),
-                                                current_file: idx + 1,
-                                                total_files,
-                                                file_name: name.clone(),
-                                                processed_bytes: done,
-                                                total_bytes: total,
-                                                percent,
-                                                is_finished: false,
-                                            });
-                                        }
-                                    },
-                                );
-                                let _ = best_effort_erase_file(&zip_path);
-                                enc_res.map(|s| ("folder".to_string(), s))
-                            }
+                    let res = if is_dir {
+                        let zip_path = temp_dir.join(format!("zip-{}.tmp", Uuid::new_v4()));
+                        if let Err(e) = zip_directory_to_file(&p, &zip_path) {
+                            let _ = fs::remove_file(&zip_path);
+                            Err(e)
                         } else {
-                            crypto::encrypt_file_stream_with_progress(
-                                &p,
+                            let enc_res = crypto::encrypt_file_stream_with_progress(
+                                &zip_path,
                                 &blob_path,
                                 &mk_bytes,
                                 |done, total| {
@@ -1400,26 +1440,53 @@ impl VaultManager {
                                         });
                                     }
                                 },
-                            )
-                            .map(|s| ("file".to_string(), s))
-                        };
+                            );
+                            let _ = best_effort_erase_file(&zip_path);
+                            enc_res.map(|s| ("folder".to_string(), s))
+                        }
+                    } else {
+                        crypto::encrypt_file_stream_with_progress(
+                            &p,
+                            &blob_path,
+                            &mk_bytes,
+                            |done, total| {
+                                if let Ok(mut cb) = on_progress_mutex.lock() {
+                                    let percent = if total > 0 {
+                                        (done as f32 / total as f32) * 100.0
+                                    } else {
+                                        100.0
+                                    };
+                                    cb(crate::models::OperationProgress {
+                                        stage: "encrypt".to_string(),
+                                        current_file: idx + 1,
+                                        total_files,
+                                        file_name: name.clone(),
+                                        processed_bytes: done,
+                                        total_bytes: total,
+                                        percent,
+                                        is_finished: false,
+                                    });
+                                }
+                            },
+                        )
+                        .map(|s| ("file".to_string(), s))
+                    };
 
-                        let mut res_lock = results.lock().unwrap();
-                        match res {
-                            Ok((kind, size)) => {
-                                res_lock.push(Ok(EncryptedItem {
-                                    p_str,
-                                    p,
-                                    name,
-                                    blob_name,
-                                    blob_path,
-                                    size,
-                                    kind,
-                                }));
-                            }
-                            Err(e) => {
-                                res_lock.push(Err(e));
-                            }
+                    let mut res_lock = results.lock().unwrap();
+                    match res {
+                        Ok((kind, size)) => {
+                            res_lock.push(Ok(EncryptedItem {
+                                p_str,
+                                p,
+                                name,
+                                blob_name,
+                                blob_path,
+                                size,
+                                kind,
+                            }));
+                        }
+                        Err(e) => {
+                            res_lock.push(Err(e));
                         }
                     }
                 });
@@ -1439,9 +1506,10 @@ impl VaultManager {
                 }
             };
 
-            let is_dup = existing.iter().chain(added.iter()).any(|e| {
-                e.name == item.name && e.size == item.size
-            });
+            let is_dup = existing
+                .iter()
+                .chain(added.iter())
+                .any(|e| e.name == item.name && e.size == item.size);
             if is_dup {
                 let _ = fs::remove_file(&item.blob_path);
                 skipped += 1;
@@ -1466,7 +1534,15 @@ impl VaultManager {
                     }
                 }
             }
-            let _ = vfs::move_to_trash(&item.p);
+            if self.shred_source {
+                if item.p.is_dir() {
+                    best_effort_erase_dir(&item.p);
+                } else {
+                    let _ = best_effort_erase_file(&item.p);
+                }
+            } else {
+                let _ = vfs::move_to_trash(&item.p);
+            }
         }
 
         self.entries.extend(added.iter().cloned());
@@ -1509,7 +1585,8 @@ impl VaultManager {
         fs::create_dir_all(&final_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
         let cursor = Cursor::new(data);
-        let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("打开 zip 失败: {e}"))?;
+        let mut archive =
+            zip::ZipArchive::new(cursor).map_err(|e| format!("打开 zip 失败: {e}"))?;
         archive
             .extract(&final_dir)
             .map_err(|e| format!("解压文件夹失败: {e}"))?;
@@ -1546,12 +1623,43 @@ impl VaultManager {
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        let is_image = matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico");
+        let is_image = matches!(
+            ext,
+            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico"
+        );
         let is_text = matches!(
             ext,
-            "txt" | "md" | "markdown" | "json" | "js" | "jsx" | "ts" | "tsx" | "rs" | "py" | "c"
-                | "cpp" | "h" | "hpp" | "html" | "htm" | "css" | "scss" | "log" | "csv" | "xml"
-                | "toml" | "yaml" | "yml" | "ini" | "sh" | "bash" | "zsh" | "sql" | "env" | "gitignore"
+            "txt"
+                | "md"
+                | "markdown"
+                | "json"
+                | "js"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "rs"
+                | "py"
+                | "c"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "html"
+                | "htm"
+                | "css"
+                | "scss"
+                | "log"
+                | "csv"
+                | "xml"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "ini"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sql"
+                | "env"
+                | "gitignore"
         );
         let is_pdf = ext == "pdf";
         let is_audio = matches!(ext, "mp3" | "wav" | "ogg" | "m4a" | "aac" | "flac");
@@ -1771,28 +1879,23 @@ impl VaultManager {
                 });
             } else {
                 let p = Self::unique_path(&target_dir, &entry.name);
-                crypto::decrypt_file_stream_with_progress(
-                    &blob_path,
-                    &p,
-                    &mk,
-                    |done, total| {
-                        let percent = if total > 0 {
-                            (done as f32 / total as f32) * 100.0
-                        } else {
-                            100.0
-                        };
-                        on_progress(crate::models::OperationProgress {
-                            stage: "export".to_string(),
-                            current_file: idx + 1,
-                            total_files,
-                            file_name: entry_name.clone(),
-                            processed_bytes: done,
-                            total_bytes: total,
-                            percent,
-                            is_finished: false,
-                        });
-                    },
-                )?;
+                crypto::decrypt_file_stream_with_progress(&blob_path, &p, &mk, |done, total| {
+                    let percent = if total > 0 {
+                        (done as f32 / total as f32) * 100.0
+                    } else {
+                        100.0
+                    };
+                    on_progress(crate::models::OperationProgress {
+                        stage: "export".to_string(),
+                        current_file: idx + 1,
+                        total_files,
+                        file_name: entry_name.clone(),
+                        processed_bytes: done,
+                        total_bytes: total,
+                        percent,
+                        is_finished: false,
+                    });
+                })?;
             }
         }
         Ok(())
@@ -1874,18 +1977,29 @@ impl VaultManager {
         validate_password_strength(new)?;
         if self.keyring_path().exists() {
             let salt = fs::read(self.salt_path()).map_err(|e| format!("读取 salt 失败: {e}"))?;
-            let keyring_bytes = fs::read(self.keyring_path())
-                .map_err(|e| format!("读取 keyring 失败: {e}"))?;
+            let keyring_bytes =
+                fs::read(self.keyring_path()).map_err(|e| format!("读取 keyring 失败: {e}"))?;
             let keyring: Keyring = serde_json::from_slice(&keyring_bytes)
                 .map_err(|e| format!("解析 keyring 失败: {e}"))?;
-            let kdf_type = keyring.kdf_type.as_deref().unwrap_or(crypto::KDF_TYPE_PBKDF2);
+            let kdf_type = keyring
+                .kdf_type
+                .as_deref()
+                .unwrap_or(crypto::KDF_TYPE_PBKDF2);
             let mut kek = if kdf_type == crypto::KDF_TYPE_ARGON2ID {
-                let mem = keyring.memory_kib.unwrap_or(crypto::ARGON2_DEFAULT_MEMORY_KIB);
-                let iters = keyring.iterations.unwrap_or(crypto::ARGON2_DEFAULT_ITERATIONS);
-                let par = keyring.parallelism.unwrap_or(crypto::ARGON2_DEFAULT_PARALLELISM);
+                let mem = keyring
+                    .memory_kib
+                    .unwrap_or(crypto::ARGON2_DEFAULT_MEMORY_KIB);
+                let iters = keyring
+                    .iterations
+                    .unwrap_or(crypto::ARGON2_DEFAULT_ITERATIONS);
+                let par = keyring
+                    .parallelism
+                    .unwrap_or(crypto::ARGON2_DEFAULT_PARALLELISM);
                 crypto::derive_key_argon2id(old, &salt, mem, iters, par)?
             } else {
-                let iters = keyring.iterations.unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
+                let iters = keyring
+                    .iterations
+                    .unwrap_or(crypto::LEGACY_PBKDF2_ITERATIONS);
                 crypto::derive_key_password_with_iter(old, &salt, iters)
             };
             let _ = crypto::decrypt(&keyring.password_wrap, &kek)?;
@@ -1925,7 +2039,9 @@ impl VaultManager {
         if let Some(lockout) = self.recovery_lockout_until {
             if now < lockout {
                 let remaining = lockout - now;
-                return Err(format!("恢复码输错次数过多，安全保护中，请等待 {remaining} 秒后再试"));
+                return Err(format!(
+                    "恢复码输错次数过多，安全保护中，请等待 {remaining} 秒后再试"
+                ));
             } else {
                 self.recovery_lockout_until = None;
             }
@@ -1952,7 +2068,10 @@ impl VaultManager {
                     ));
                 }
                 let tries_left = 3 - self.recovery_failed_attempts;
-                return Err(format!("恢复码错误！剩余 {} 次尝试后将触发安全冷却延迟", tries_left));
+                return Err(format!(
+                    "恢复码错误！剩余 {} 次尝试后将触发安全冷却延迟",
+                    tries_left
+                ));
             }
         };
         let _ = self.load_index_with_key(&mk)?;
@@ -2071,9 +2190,11 @@ impl VaultManager {
         // 代次必须单调递增：以钥匙串锚点（其次现有索引）为基线 +1，
         // 这样即便攻击者把旧 index.enc / index.enc.bak 复制回来，也会因代次过小而拒绝加载。
         let generation = self.current_index_generation(mk).saturating_add(1);
+        let padding_len = 64 + (rand::thread_rng().next_u32() % 192) as usize;
         let index = IndexData {
             generation,
             entries: self.entries.clone(),
+            padding: Some(crypto::random_bytes(padding_len)),
         };
         let json = serde_json::to_vec(&index).map_err(|e| format!("序列化索引失败: {e}"))?;
         let enc = crypto::encrypt(&json, mk)?;
@@ -2162,12 +2283,275 @@ impl VaultManager {
         let _ = save_meta_json(&self.config_path, &cfg);
     }
 
+    pub fn get_shred_source(&self) -> bool {
+        self.shred_source
+    }
+
+    pub fn set_shred_source(&mut self, enabled: bool) -> Result<(), String> {
+        self.shred_source = enabled;
+        let mut cfg = load_config(&self.config_path).unwrap_or_default();
+        cfg.shred_source_after_import = Some(enabled);
+        save_meta_json(&self.config_path, &cfg)?;
+        Ok(())
+    }
+
+    pub fn get_privacy_screen_protection(&self) -> bool {
+        self.privacy_screen_protection
+    }
+
+    pub fn set_privacy_screen_protection(&mut self, enabled: bool) -> Result<(), String> {
+        self.privacy_screen_protection = enabled;
+        let mut cfg = load_config(&self.config_path).unwrap_or_default();
+        cfg.privacy_screen_protection = Some(enabled);
+        save_meta_json(&self.config_path, &cfg)?;
+        Ok(())
+    }
+
+    pub fn is_biometrics_available(&self) -> bool {
+        biometrics::is_biometrics_available()
+    }
+
+    pub fn get_biometrics_enabled(&self) -> bool {
+        self.biometrics_enabled
+    }
+
+    pub fn set_biometrics_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.biometrics_enabled = enabled;
+        let mut cfg = load_config(&self.config_path).unwrap_or_default();
+        cfg.biometrics_enabled = Some(enabled);
+        save_meta_json(&self.config_path, &cfg)?;
+        Ok(())
+    }
+
+    /// 使用生物识别（Touch ID / Windows Hello）快速解锁保险箱。
+    /// 硬件身份核验通过后，自动解密设备钥匙串中的凭据完成解锁。
+    pub fn unlock_with_biometrics(&mut self) -> Result<Vec<VaultEntry>, String> {
+        self.touch();
+        if !self.is_biometrics_available() {
+            return Err("当前硬件设备不支持生物识别（Touch ID / Windows Hello）".into());
+        }
+        if !self.has_saved_password() {
+            return Err(
+                "尚未在系统钥匙串中记录当前保险箱凭据，请先使用密码解锁并勾选「记住密码」".into(),
+            );
+        }
+        biometrics::authenticate("解锁 FileLocker 个人安全保险箱")?;
+        self.unlock_with_keychain()
+    }
+
+
+    /// 为原地编辑打开文件：解密到专用的受隔离编辑目录，使用系统默认应用程序打开，并开始自动同步追踪。
+    pub fn open_entry_for_edit(&mut self, id: &str) -> Result<String, String> {
+        self.touch();
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+            .ok_or_else(|| "条目不存在".to_string())?;
+
+        if entry.kind == "folder" {
+            return Err("目录不支持直接原地编辑，请使用导出功能".to_string());
+        }
+
+        let mk = self.require_unlocked()?;
+        let blob_path = self.data_dir.join(&entry.cipher_path);
+        if !blob_path.exists() {
+            return Err("密文文件缺失".to_string());
+        }
+
+        let edit_base = self.temp_dir.join("editing").join(&entry.id);
+        ensure_temp_dir_hidden(&edit_base).map_err(|e| format!("创建编辑隔离目录失败: {e}"))?;
+        let target_path = edit_base.join(&entry.name);
+
+        create_private_file(&target_path).map_err(|e| format!("创建临时编辑文件失败: {e}"))?;
+        crypto::decrypt_file_stream(&blob_path, &target_path, &mk)?;
+
+        let meta = fs::metadata(&target_path).map_err(|e| format!("读取文件元数据失败: {e}"))?;
+        let last_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last_size = meta.len();
+        let now = Utc::now().timestamp_millis();
+
+        // 调用系统默认应用打开；在无头测试或特殊环境即便拉起应用受限，也继续开启追踪
+        let _ = vfs::open_path(&target_path);
+
+        self.active_edits.insert(
+            id.to_string(),
+            ActiveEditTracking {
+                entry_id: id.to_string(),
+                file_name: entry.name.clone(),
+                temp_path: target_path.clone(),
+                opened_at: now,
+                last_mtime,
+                last_size,
+            },
+        );
+
+        Ok(target_path.to_string_lossy().to_string())
+    }
+
+    /// 检查所有正在原地编辑的会话，若检测到外部保存修改，则自动重新加密写回保险箱并更新索引。
+    /// 返回本次成功同步重加密的 entry_id 列表。
+    pub fn check_and_sync_edits(&mut self) -> Result<Vec<String>, String> {
+        if !self.is_unlocked || self.active_edits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mk = match self.master_key.as_ref() {
+            Some(k) => k.clone(),
+            None => return Ok(Vec::new()),
+        };
+
+        let mut synced_ids = Vec::new();
+        let edit_entries: Vec<(String, PathBuf, u64, u64)> = self
+            .active_edits
+            .values()
+            .map(|t| {
+                (
+                    t.entry_id.clone(),
+                    t.temp_path.clone(),
+                    t.last_mtime,
+                    t.last_size,
+                )
+            })
+            .collect();
+
+        for (id, temp_path, last_mtime, last_size) in edit_entries {
+            if !temp_path.exists() {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(&temp_path) {
+                let cur_mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let cur_size = meta.len();
+
+                // 外部软件执行了保存（mtime 递增或大小改变）
+                if cur_mtime != last_mtime || cur_size != last_size {
+                    if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
+                        let cipher_path = self.entries[pos].cipher_path.clone();
+                        let blob_path = self.data_dir.join(&cipher_path);
+                        let temp_blob = self.temp_dir.join(format!("{}.blob.tmp", Uuid::new_v4()));
+
+                        // 尝试重新分块加密
+                        match crypto::encrypt_file_stream(&temp_path, &temp_blob, &mk) {
+                            Ok(_) => {
+                                if let Err(e) = atomic_replace(&temp_blob, &blob_path) {
+                                    eprintln!("原地编辑原子替换密文失败: {e}");
+                                    let _ = fs::remove_file(&temp_blob);
+                                    continue;
+                                }
+
+                                self.entries[pos].size = cur_size;
+                                self.entries[pos].added_at = Utc::now().timestamp_millis();
+
+                                if let Some(tracking) = self.active_edits.get_mut(&id) {
+                                    tracking.last_mtime = cur_mtime;
+                                    tracking.last_size = cur_size;
+                                }
+
+                                synced_ids.push(id);
+                            }
+                            Err(e) => {
+                                eprintln!("原地编辑重加密暂缓（可能写入中）: {e}");
+                                let _ = fs::remove_file(&temp_blob);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !synced_ids.is_empty() {
+            self.save_index()?;
+        }
+
+        Ok(synced_ids)
+    }
+
+    /// 完成某个文件的原地编辑：执行最后一次同步，随后使用安全粉碎（多轮覆写）彻底销毁明文文件并删除临时目录。
+    pub fn finish_entry_edit(&mut self, id: &str) -> Result<(), String> {
+        self.touch();
+        let tracking = self
+            .active_edits
+            .remove(id)
+            .ok_or_else(|| "未找到该条目的编辑会话".to_string())?;
+
+        // 最后一次检查并保存潜在修改
+        if self.is_unlocked && tracking.temp_path.exists() {
+            if let Ok(meta) = fs::metadata(&tracking.temp_path) {
+                let cur_mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let cur_size = meta.len();
+
+                if cur_mtime != tracking.last_mtime || cur_size != tracking.last_size {
+                    if let Some(pos) = self.entries.iter().position(|e| e.id == *id) {
+                        if let Some(mk) = self.master_key.as_ref() {
+                            let cipher_path = self.entries[pos].cipher_path.clone();
+                            let blob_path = self.data_dir.join(&cipher_path);
+                            let temp_blob =
+                                self.temp_dir.join(format!("{}.blob.tmp", Uuid::new_v4()));
+                            if crypto::encrypt_file_stream(&tracking.temp_path, &temp_blob, mk)
+                                .is_ok()
+                            {
+                                if atomic_replace(&temp_blob, &blob_path).is_ok() {
+                                    self.entries[pos].size = cur_size;
+                                    self.entries[pos].added_at = Utc::now().timestamp_millis();
+                                    let _ = self.save_index();
+                                }
+                            }
+                            let _ = fs::remove_file(&temp_blob);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 安全粉碎销毁临时明文
+        if tracking.temp_path.exists() {
+            let _ = best_effort_erase_file(&tracking.temp_path);
+        }
+        if let Some(parent) = tracking.temp_path.parent() {
+            if parent.exists() && parent != self.temp_dir {
+                let _ = fs::remove_dir_all(parent);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 列出当前所有活跃的原地编辑会话
+    pub fn list_active_edits(&self) -> Vec<ActiveEditSession> {
+        let now = Utc::now().timestamp_millis();
+        self.active_edits
+            .values()
+            .map(|t| ActiveEditSession {
+                entry_id: t.entry_id.clone(),
+                file_name: t.file_name.clone(),
+                opened_at: t.opened_at,
+                last_synced_at: now,
+                is_dirty: false,
+            })
+            .collect()
+    }
+
     pub fn reset_vault(&mut self) -> Result<(), String> {
         // 破坏性操作：必须处于已解锁状态，避免锁定态下被静默清空数据。
         self.require_unlocked()?;
         if self.vault_dir.exists() {
-            fs::remove_dir_all(&self.vault_dir)
-                .map_err(|e| format!("删除 vault 目录失败: {e}"))?;
+            fs::remove_dir_all(&self.vault_dir).map_err(|e| format!("删除 vault 目录失败: {e}"))?;
         }
         let _ = keychain::delete_password(&self.current_vault_id);
         let _ = keychain::delete_device_key(&self.current_vault_id);
@@ -2178,6 +2562,7 @@ impl VaultManager {
         self.master_key = None;
         self.entries.clear();
         self.is_unlocked = false;
+        self.active_edits.clear();
         let _ = create_private_dir(&self.data_dir);
         let _ = ensure_temp_dir_hidden(&self.temp_dir);
         Ok(())
@@ -2285,9 +2670,7 @@ fn zip_directory_to_file(dir: &Path, dest: &Path) -> Result<(), String> {
 
     let mut writer = zip.finish().map_err(|e| format!("完成 zip 失败: {e}"))?;
     use std::io::Write;
-    writer
-        .flush()
-        .map_err(|e| format!("刷新 zip 失败: {e}"))?;
+    writer.flush().map_err(|e| format!("刷新 zip 失败: {e}"))?;
     Ok(())
 }
 
@@ -2319,6 +2702,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         }
     }
 
@@ -2343,7 +2730,8 @@ mod tests {
 
     #[test]
     fn test_stream_encryption_roundtrip() {
-        let temp_dir = std::env::temp_dir().join(format!("filelocker_stream_test_{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_stream_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
         let src_path = temp_dir.join("large_sample.dat");
         let enc_path = temp_dir.join("large_sample.dat.enc");
@@ -2371,7 +2759,8 @@ mod tests {
 
     #[test]
     fn test_rename_entry() {
-        let temp_dir = std::env::temp_dir().join(format!("filelocker_rename_test_{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_rename_test_{}", Uuid::new_v4()));
         let vault_dir = temp_dir.join("vault");
         let data_dir = vault_dir.join("data");
         let temp_sub = vault_dir.join("tmp");
@@ -2395,6 +2784,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         };
 
         vm.entries.push(VaultEntry {
@@ -2447,6 +2840,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         };
 
         vm.entries.push(VaultEntry {
@@ -2492,7 +2889,8 @@ mod tests {
 
     #[test]
     fn test_multi_vault_switching() {
-        let temp_dir = std::env::temp_dir().join(format!("filelocker_multivault_test_{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_multivault_test_{}", Uuid::new_v4()));
         let vault_dir = temp_dir.join("vault");
         let data_dir = vault_dir.join("data");
         let temp_sub = vault_dir.join("tmp");
@@ -2516,6 +2914,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         };
 
         // 默认保险箱先初始化密码（后续删除保护需在解锁态验证）
@@ -2529,7 +2931,9 @@ mod tests {
         assert_eq!(list[0].name, "默认保险箱");
 
         // 创建新保险箱 "工作保险箱"
-        let create_res = vm.create_vault("工作保险箱", "WorkPass123!", false).unwrap();
+        let create_res = vm
+            .create_vault("工作保险箱", "WorkPass123!", false)
+            .unwrap();
         assert_eq!(create_res.vault.name, "工作保险箱");
         assert_eq!(vm.current_vault_name, "工作保险箱");
         assert!(vm.is_unlocked);
@@ -2569,7 +2973,8 @@ mod tests {
 
     #[test]
     fn test_best_effort_erase_file() {
-        let temp_dir = std::env::temp_dir().join(format!("filelocker_shred_test_{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_shred_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
         let target = temp_dir.join("sensitive_secret.txt");
         fs::write(&target, b"Confidential plain text!").unwrap();
@@ -2583,7 +2988,8 @@ mod tests {
 
     #[test]
     fn test_unlock_rate_limiting() {
-        let temp_dir = std::env::temp_dir().join(format!("filelocker_ratelimit_test_{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("filelocker_ratelimit_test_{}", Uuid::new_v4()));
         let vault_dir = temp_dir.join("vault");
         let data_dir = vault_dir.join("data");
         let temp_sub = vault_dir.join("tmp");
@@ -2607,6 +3013,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         };
 
         vm.set_password("CorrectPassword123!", false).unwrap();
@@ -2631,8 +3041,7 @@ mod tests {
 
     #[test]
     fn test_kdf_upgrade_from_weak_iterations() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("filelocker_kdf_test_{}", Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("filelocker_kdf_test_{}", Uuid::new_v4()));
         let vault_dir = temp_dir.join("vault");
         let data_dir = vault_dir.join("data");
         let temp_sub = vault_dir.join("tmp");
@@ -2656,6 +3065,10 @@ mod tests {
             recovery_failed_attempts: 0,
             recovery_lockout_until: None,
             last_activity: Cell::new(Utc::now().timestamp()),
+            shred_source: true,
+            privacy_screen_protection: false,
+            biometrics_enabled: false,
+            active_edits: std::collections::HashMap::new(),
         };
 
         let recovery_code = vm.set_password("OldPassword123!", false).unwrap();
@@ -2695,17 +3108,22 @@ mod tests {
         let upgraded: Keyring =
             serde_json::from_slice(&fs::read(vm.keyring_path()).unwrap()).unwrap();
         assert_eq!(upgraded.version, KEYRING_VERSION);
-        assert_eq!(upgraded.kdf_type.as_deref(), Some(crypto::KDF_TYPE_ARGON2ID));
+        assert_eq!(
+            upgraded.kdf_type.as_deref(),
+            Some(crypto::KDF_TYPE_ARGON2ID)
+        );
         assert_eq!(upgraded.iterations, Some(crypto::ARGON2_DEFAULT_ITERATIONS));
         assert_eq!(upgraded.recovery_iterations, Some(100_000));
         assert_eq!(upgraded.recovery_kdf_type.as_deref(), Some("pbkdf2"));
 
         // 升级后旧恢复码仍然有效
         vm.lock();
-        assert!(vm
-            .recover_password(&recovery_code, "NewPassword123!")
-            .unwrap()
-            .len() > 0);
+        assert!(
+            vm.recover_password(&recovery_code, "NewPassword123!")
+                .unwrap()
+                .len()
+                > 0
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -2724,9 +3142,7 @@ mod tests {
 
         // 模拟重启：新实例从 security.json 恢复冷却，无法通过重启绕过
         let mut restarted = make_test_vm(&base, "vault-a");
-        let err = restarted
-            .unlock("CorrectPassword123!", false)
-            .unwrap_err();
+        let err = restarted.unlock("CorrectPassword123!", false).unwrap_err();
         assert!(err.contains("安全保护中"), "实际错误: {err}");
 
         // 冷却按保险箱隔离：另一个保险箱不应受牵连
@@ -2745,7 +3161,9 @@ mod tests {
         vm.lock();
 
         for _ in 0..2 {
-            assert!(vm.recover_password("WRONG-CODE", "NewPassword123!").is_err());
+            assert!(vm
+                .recover_password("WRONG-CODE", "NewPassword123!")
+                .is_err());
         }
         let err = vm
             .recover_password("WRONG-CODE", "NewPassword123!")
@@ -2771,7 +3189,10 @@ mod tests {
         vm.lock();
 
         assert!(vm.reset_vault().unwrap_err().contains("尚未解锁"));
-        assert!(vm.delete_entry("whatever").unwrap_err().contains("尚未解锁"));
+        assert!(vm
+            .delete_entry("whatever")
+            .unwrap_err()
+            .contains("尚未解锁"));
         assert!(vm
             .delete_entries(&["a".to_string()])
             .unwrap_err()
@@ -2789,7 +3210,10 @@ mod tests {
         let base = tmp_base("pwd_policy");
         let mut vm = make_test_vm(&base, "vault-a");
 
-        assert!(vm.set_password("short", false).unwrap_err().contains("至少"));
+        assert!(vm
+            .set_password("short", false)
+            .unwrap_err()
+            .contains("至少"));
         assert!(vm
             .set_password("12345678", false)
             .unwrap_err()
@@ -2819,7 +3243,11 @@ mod tests {
         let mut paths = Vec::new();
         for i in 0..6 {
             let file_path = source_dir.join(format!("test_doc_{i}.txt"));
-            fs::write(&file_path, format!("File payload data for index {i}").repeat(500)).unwrap();
+            fs::write(
+                &file_path,
+                format!("File payload data for index {i}").repeat(500),
+            )
+            .unwrap();
             paths.push(file_path.to_string_lossy().to_string());
         }
 
@@ -2837,7 +3265,8 @@ mod tests {
         // 验证导出
         let export_dir = base.join("exported");
         let ids: Vec<String> = vm.entries.iter().map(|e| e.id.clone()).collect();
-        vm.export_entries_to_dir(&ids, &export_dir.to_string_lossy()).unwrap();
+        vm.export_entries_to_dir(&ids, &export_dir.to_string_lossy())
+            .unwrap();
 
         for i in 0..6 {
             let exported_file = export_dir.join(format!("test_doc_{i}.txt"));
@@ -2875,7 +3304,10 @@ mod tests {
         // 重启实例：HMAC 校验应失败，并触发惩罚性防暴力破解冷却
         let mut restarted = make_test_vm(&base, "vault-tamper");
         let err = restarted.unlock("MyStrongPass123!", false).unwrap_err();
-        assert!(err.contains("安全保护中"), "篡改后应检测到异常并强制冷却，实际错误: {err}");
+        assert!(
+            err.contains("安全保护中"),
+            "篡改后应检测到异常并强制冷却，实际错误: {err}"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2890,7 +3322,9 @@ mod tests {
         let secret_text = "Highly confidential data: NDA-2026-X999";
         fs::write(&test_file, secret_text).unwrap();
 
-        let added = vm.add_files(vec![test_file.to_string_lossy().to_string()]).unwrap();
+        let added = vm
+            .add_files(vec![test_file.to_string_lossy().to_string()])
+            .unwrap();
         assert_eq!(added.len(), 1);
         let entry_id = &added[0].id;
 
@@ -2905,7 +3339,10 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name() != ".metadata_never_index")
             .collect();
-        assert!(temp_files.is_empty(), "内存无痕预览绝不应在磁盘留下任何临时明文！");
+        assert!(
+            temp_files.is_empty(),
+            "内存无痕预览绝不应在磁盘留下任何临时明文！"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2947,7 +3384,10 @@ mod tests {
         // 验证物理磁盘上的内容不是明文 JSON（开头是魔数，且包含密文）
         let disk_bytes = fs::read(&meta_file).unwrap();
         assert!(disk_bytes.starts_with(META_MAGIC));
-        assert!(serde_json::from_slice::<Vec<VaultProfile>>(&disk_bytes).is_err(), "落盘数据已被加密，绝不能以明文 JSON 直接反序列化！");
+        assert!(
+            serde_json::from_slice::<Vec<VaultProfile>>(&disk_bytes).is_err(),
+            "落盘数据已被加密，绝不能以明文 JSON 直接反序列化！"
+        );
 
         // 验证通过解密能完整还原数据
         let cipher_payload = disk_bytes.strip_prefix(META_MAGIC).unwrap();
@@ -2955,6 +3395,94 @@ mod tests {
         let parsed: Vec<VaultProfile> = serde_json::from_slice(&decrypted).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1].name, "个人隐私证件");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_privacy_shield_and_shred_source_config() {
+        let base = tmp_base("config_features");
+        let mut vm = make_test_vm(&base, "vault-cfg");
+
+        // 默认状态
+        assert!(vm.get_shred_source());
+        assert!(!vm.get_privacy_screen_protection());
+
+        // 变更配置
+        vm.set_privacy_screen_protection(true).unwrap();
+        vm.set_shred_source(false).unwrap();
+        assert!(vm.get_privacy_screen_protection());
+        assert!(!vm.get_shred_source());
+
+        // 重新加载配置验证落盘持久化
+        let reloaded_cfg = load_config(&vm.config_path).unwrap();
+        assert_eq!(reloaded_cfg.privacy_screen_protection, Some(true));
+        assert_eq!(reloaded_cfg.shred_source_after_import, Some(false));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_in_place_edit_lifecycle_and_auto_sync() {
+        let base = tmp_base("in_place_edit");
+        let mut vm = make_test_vm(&base, "vault-edit");
+        vm.set_password("MyStrongPass123!", false).unwrap();
+
+        // 1. 创建源文件并添加进保险箱
+        let test_file = base.join("todo.md");
+        let initial_content = "# Todo List\n- Task 1: Security Audit";
+        fs::write(&test_file, initial_content).unwrap();
+
+        let added = vm
+            .add_files(vec![test_file.to_string_lossy().to_string()])
+            .unwrap();
+        let entry_id = added[0].id.clone();
+
+        // 2. 开启原地编辑
+        let edit_temp_path = vm.open_entry_for_edit(&entry_id).unwrap();
+        let edit_path = PathBuf::from(&edit_temp_path);
+        assert!(edit_path.exists());
+        assert_eq!(fs::read_to_string(&edit_path).unwrap(), initial_content);
+        assert_eq!(vm.list_active_edits().len(), 1);
+
+        // 3. 模拟用户在外部软件中修改并保存文件
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let updated_content =
+            "# Todo List\n- Task 1: Security Audit [Done]\n- Task 2: In-place edit";
+        fs::write(&edit_path, updated_content).unwrap();
+
+        // 4. 后台检测并自动重新分块加密写回保险箱
+        let synced = vm.check_and_sync_edits().unwrap();
+        assert_eq!(synced, vec![entry_id.clone()]);
+        assert_eq!(vm.entries[0].size, updated_content.len() as u64);
+
+        // 5. 完成编辑：安全粉碎临时文件
+        vm.finish_entry_edit(&entry_id).unwrap();
+        assert!(
+            !edit_path.exists(),
+            "完成编辑后临时明文必须被安全粉碎彻底删除！"
+        );
+        assert!(vm.active_edits.is_empty());
+
+        // 6. 验证保险箱密文已成功更新为最新内容
+        let preview = vm.read_entry_preview(&entry_id).unwrap();
+        assert_eq!(preview.text_content.unwrap(), updated_content);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_biometrics_config_and_status() {
+        let base = tmp_base("biometrics_cfg");
+        let mut vm = make_test_vm(&base, "vault-bio");
+
+        assert!(!vm.get_biometrics_enabled());
+
+        vm.set_biometrics_enabled(true).unwrap();
+        assert!(vm.get_biometrics_enabled());
+
+        let reloaded_cfg = load_config(&vm.config_path).unwrap();
+        assert_eq!(reloaded_cfg.biometrics_enabled, Some(true));
 
         let _ = fs::remove_dir_all(&base);
     }

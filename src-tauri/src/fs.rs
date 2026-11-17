@@ -102,7 +102,10 @@ fn windows_shell_open(p: &Path) -> Result<(), String> {
     if ret as isize > 32 {
         Ok(())
     } else {
-        Err(format!("系统无法打开该文件（ShellExecuteW 返回 {}）", ret as isize))
+        Err(format!(
+            "系统无法打开该文件（ShellExecuteW 返回 {}）",
+            ret as isize
+        ))
     }
 }
 

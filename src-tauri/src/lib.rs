@@ -1,3 +1,4 @@
+pub mod biometrics;
 pub mod crypto;
 pub mod fs;
 pub mod keychain;
@@ -9,7 +10,7 @@ use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::models::{CreateVaultResult, VaultEntry, VaultInfo};
+use crate::models::{ActiveEditSession, CreateVaultResult, VaultEntry, VaultInfo};
 use crate::vault::VaultManager;
 
 type VaultState = Mutex<VaultManager>;
@@ -61,9 +62,150 @@ fn is_unlocked(state: State<VaultState>) -> bool {
     state.lock().map(|v| v.is_unlocked).unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+pub fn apply_privacy_screen_protection(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+) -> Result<(), String> {
+    use objc::{msg_send, sel, sel_impl};
+    let ns_window_ptr = window
+        .ns_window()
+        .map_err(|e| format!("获取原生窗口指针失败: {e}"))?;
+    // NSWindowSharingNone = 0, NSWindowSharingReadOnly = 1
+    let sharing_type: usize = if enabled { 0 } else { 1 };
+    unsafe {
+        let () =
+            msg_send![ns_window_ptr as *mut objc::runtime::Object, setSharingType: sharing_type];
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_privacy_screen_protection(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+) -> Result<(), String> {
+    use std::ffi::c_void;
+    if let Ok(hwnd) = window.hwnd() {
+        // WDA_NONE = 0x00000000, WDA_EXCLUDEFROMCAPTURE = 0x00000011
+        let affinity: u32 = if enabled { 0x00000011 } else { 0x00000000 };
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowDisplayAffinity(hWnd: *mut c_void, dwAffinity: u32) -> i32;
+        }
+        unsafe {
+            let _ = SetWindowDisplayAffinity(hwnd.0 as *mut c_void, affinity);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn apply_privacy_screen_protection(
+    _window: &tauri::WebviewWindow,
+    _enabled: bool,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn get_privacy_screen_protection(state: State<VaultState>) -> bool {
+    state
+        .lock()
+        .map(|v| v.get_privacy_screen_protection())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_privacy_screen_protection(
+    window: tauri::WebviewWindow,
+    enabled: bool,
+    state: State<VaultState>,
+) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.set_privacy_screen_protection(enabled)?;
+    apply_privacy_screen_protection(&window, enabled)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_shred_source(state: State<VaultState>) -> bool {
+    state.lock().map(|v| v.get_shred_source()).unwrap_or(true)
+}
+
+#[tauri::command]
+fn set_shred_source(enabled: bool, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.set_shred_source(enabled)
+}
+
+#[tauri::command]
+fn open_entry_for_edit(id: String, state: State<VaultState>) -> Result<String, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.open_entry_for_edit(&id)
+}
+
+#[tauri::command]
+fn finish_entry_edit(id: String, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.finish_entry_edit(&id)
+}
+
+#[tauri::command]
+fn list_active_edits(state: State<VaultState>) -> Result<Vec<ActiveEditSession>, String> {
+    let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    Ok(v.list_active_edits())
+}
+
+#[tauri::command]
+fn is_biometrics_available(state: State<VaultState>) -> bool {
+    state
+        .lock()
+        .map(|v| v.is_biometrics_available())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_biometrics_enabled(state: State<VaultState>) -> bool {
+    state
+        .lock()
+        .map(|v| v.get_biometrics_enabled())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_biometrics_enabled(enabled: bool, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.set_biometrics_enabled(enabled)
+}
+
+#[tauri::command]
+fn unlock_with_biometrics(state: State<VaultState>) -> Result<Vec<VaultEntry>, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.unlock_with_biometrics()
+}
+
+/// 老板键 / 防窥急救锁：立即清空内存主密钥回归锁定态，并隐藏主窗口
+#[tauri::command]
+fn panic_lock(app: tauri::AppHandle, state: State<VaultState>) -> Result<(), String> {
+    {
+        let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+        v.lock();
+    }
+    let _ = app.emit("vault-auto-locked", ());
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn has_saved_password(state: State<VaultState>) -> bool {
-    state.lock().map(|v| v.has_saved_password()).unwrap_or(false)
+    state
+        .lock()
+        .map(|v| v.has_saved_password())
+        .unwrap_or(false)
 }
 
 /// 使用系统钥匙串中已记住的密码解锁（非生物识别）。
@@ -119,7 +261,10 @@ fn add_files(
 }
 
 #[tauri::command]
-fn read_entry_preview(id: String, state: State<VaultState>) -> Result<models::EntryPreviewData, String> {
+fn read_entry_preview(
+    id: String,
+    state: State<VaultState>,
+) -> Result<models::EntryPreviewData, String> {
     let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.read_entry_preview(&id)
 }
@@ -213,10 +358,7 @@ fn clear_temp(state: State<VaultState>) -> Result<(), String> {
 
 #[tauri::command]
 fn get_auto_lock_minutes(state: State<VaultState>) -> u64 {
-    state
-        .lock()
-        .map(|v| v.get_auto_lock_minutes())
-        .unwrap_or(5)
+    state.lock().map(|v| v.get_auto_lock_minutes()).unwrap_or(5)
 }
 
 #[tauri::command]
@@ -461,7 +603,10 @@ mod windows_clipboard {
     const GMEM_MOVEABLE: u32 = 0x0002;
 
     fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     /// 将敏感文本写入剪贴板，同时附加 Windows 剪贴板历史记录与云同步排除标志。
@@ -643,6 +788,83 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(VaultManager::new()))
         .setup(|app| {
+            // 系统托盘常驻与菜单初始化
+            let tray_menu = tauri::menu::MenuBuilder::new(app)
+                .text("show", "打开 FileLocker")
+                .text("boss_lock", "⚡ 紧急防窥锁屏 (Boss Key)")
+                .separator()
+                .text("quit", "退出 FileLocker")
+                .build()?;
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                let _ = tauri::tray::TrayIconBuilder::new()
+                    .icon(icon)
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .tooltip("FileLocker 本地安全保险箱")
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "boss_lock" => {
+                            let state = app.state::<VaultState>();
+                            if let Ok(mut v) = state.lock() {
+                                v.lock();
+                            }
+                            let _ = app.emit("vault-auto-locked", ());
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.hide();
+                            }
+                        }
+                        "quit" => {
+                            let state = app.state::<VaultState>();
+                            if let Ok(mut v) = state.lock() {
+                                v.lock();
+                            }
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                if let Ok(visible) = w.is_visible() {
+                                    if visible {
+                                        let _ = w.hide();
+                                    } else {
+                                        let _ = w.show();
+                                        let _ = w.unminimize();
+                                        let _ = w.set_focus();
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .build(app);
+            }
+
+            // 应用启动时自动恢复防录屏/防截屏窗口保护状态
+            let privacy_protection = {
+                let state = app.state::<VaultState>();
+                state
+                    .lock()
+                    .map(|v| v.get_privacy_screen_protection())
+                    .unwrap_or(false)
+            };
+            if let Some(main_win) = app.get_webview_window("main") {
+                let _ = apply_privacy_screen_protection(&main_win, privacy_protection);
+            }
+
             // Rust 侧权威自动锁：不依赖前端计时器，前端被绕过也无法阻止空闲锁定。
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -666,6 +888,30 @@ pub fn run() {
                     was_unlocked = unlocked;
                 }
             });
+
+            // 原地编辑后台自动同步监听协程（每 1.5 秒检查一次打开编辑的文件修改状态）
+            let handle_sync = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(1500));
+                let synced_ids = {
+                    let state = handle_sync.state::<VaultState>();
+                    let result = match state.lock() {
+                        Ok(mut v) => {
+                            if v.is_unlocked && !v.active_edits.is_empty() {
+                                v.check_and_sync_edits().unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    result
+                };
+                for id in synced_ids {
+                    let _ = handle_sync.emit("vault-entry-auto-saved", id);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -705,14 +951,34 @@ pub fn run() {
             rename_vault,
             delete_vault,
             copy_sensitive_text,
+            get_privacy_screen_protection,
+            set_privacy_screen_protection,
+            get_shred_source,
+            set_shred_source,
+            open_entry_for_edit,
+            finish_entry_edit,
+            list_active_edits,
+            is_biometrics_available,
+            get_biometrics_enabled,
+            set_biometrics_enabled,
+            unlock_with_biometrics,
+            panic_lock,
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = window.try_state::<Mutex<VaultManager>>() {
-                    if let Ok(mut v) = state.lock() {
-                        v.lock();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // 点击窗口关闭按钮 [X] 时，静默隐藏到系统托盘常驻，避免丢失后台监听
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+                tauri::WindowEvent::Destroyed => {
+                    if let Some(state) = window.try_state::<Mutex<VaultManager>>() {
+                        if let Ok(mut v) = state.lock() {
+                            v.lock();
+                        }
                     }
                 }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

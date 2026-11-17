@@ -73,6 +73,12 @@ pub struct AppConfig {
     /// 导入文件后是否安全粉碎原文件（而非移入系统废纸篓保留明文）
     #[serde(default)]
     pub shred_source_after_import: Option<bool>,
+    /// 窗口防截屏/防录屏遮罩保护（防止屏幕共享、录屏软件截获敏感窗口）
+    #[serde(default)]
+    pub privacy_screen_protection: Option<bool>,
+    /// 是否启用 Touch ID / 生物识别快速解锁
+    #[serde(default)]
+    pub biometrics_enabled: Option<bool>,
 }
 
 /// 保险箱概况
@@ -124,4 +130,14 @@ pub struct EntryPreviewData {
     pub data_base64: Option<String>,
     pub text_content: Option<String>,
     pub size: u64,
+}
+
+/// 正在原地编辑的会话信息
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ActiveEditSession {
+    pub entry_id: String,
+    pub file_name: String,
+    pub opened_at: i64,
+    pub last_synced_at: i64,
+    pub is_dirty: bool,
 }

@@ -40,6 +40,9 @@ hdiutil create -volname "FileLocker" \
 echo "==> 签名 DMG (ad-hoc) ..."
 codesign --force --sign - "$DMG_PATH" 2>/dev/null || true
 
+# 清理临时打包暂存区（避免 staging/Applications 软链接导致 IDE 索引全盘软件）
+rm -rf "$STAGING"
+
 SIZE=$(du -h "$DMG_PATH" | cut -f1)
 echo
 echo "✅ 打包完成: $DMG_PATH ($SIZE)"

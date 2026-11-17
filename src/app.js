@@ -37,6 +37,11 @@ const state = {
   lockoutRemaining: 0,
   lockoutInterval: null,
   privacyBlurEnabled: localStorage.getItem('filelocker_privacy_blur') !== 'false',
+  privacyScreenProtection: false,
+  shredSourceEnabled: true,
+  biometricsAvailable: false,
+  biometricsEnabled: true,
+  activeEdits: new Set(),
   pickingFile: false,
 };
 
@@ -307,6 +312,22 @@ async function initAutoLockListener() {
   } catch {}
 }
 
+async function initAutoSaveListener() {
+  try {
+    await listen('vault-entry-auto-saved', async (e) => {
+      const entryId = e.payload;
+      try {
+        state.entries = await invoke('list_entries');
+        const entry = state.entries.find(x => x.id === entryId);
+        const name = entry ? entry.name : '文件';
+        showToast(`⚡ 已自动加密同步保存：${name}`);
+        const list = $('#listContainer');
+        if (list) renderListInto(list);
+      } catch (err) { console.warn(err); }
+    });
+  } catch {}
+}
+
 let progressDismissTimer = null;
 function handleOperationProgress(p) {
   const card = $('#operationProgressCard');
@@ -550,6 +571,41 @@ function renderUnlock() {
     }
   };
 
+  const bioBtn = el('button', {
+    class: 'btn bio-btn',
+    style: 'display: flex; align-items: center; justify-content: center; gap: 6px;',
+    onclick: () => doBioUnlock()
+  }, '👆 Touch ID 快速解锁');
+
+  const doBioUnlock = async () => {
+    if (unlocking || state.lockoutRemaining > 0) return;
+    unlocking = true;
+    errDiv.textContent = '';
+    if (bioBtn) {
+      bioBtn.disabled = true;
+      bioBtn.textContent = '👆 请验证指纹或设备密码…';
+    }
+    try {
+      const entries = await invoke('unlock_with_biometrics');
+      state.entries = entries;
+      if (state.currentVault) state.currentVault.is_unlocked = true;
+      enterMain();
+    } catch (e) {
+      const errStr = String(e || 'Touch ID 验证失败');
+      errDiv.textContent = errStr;
+      if (bioBtn) {
+        bioBtn.disabled = false;
+        bioBtn.textContent = '👆 Touch ID 快速解锁';
+      }
+      unlocking = false;
+
+      const match = errStr.match(/请等待\s*(\d+)\s*秒/);
+      if (match) {
+        startLockoutCountdown(parseInt(match[1]), unlockBtn, pwd, errDiv);
+      }
+    }
+  };
+
   const goRecovery = () => {
     state.recoveryStep = 1;
     state.recoveryCodeInput = '';
@@ -568,9 +624,10 @@ function renderUnlock() {
     unlockBtn
   );
   if (state.hasSavedPassword) {
+    const isBio = state.biometricsAvailable && state.biometricsEnabled;
     card.append(
       el('div', { class: 'auth-divider' }, el('span', {}, '或')),
-      keychainBtn
+      isBio ? bioBtn : keychainBtn
     );
   }
   card.append(el('button', { class: 'link-btn', onclick: goRecovery }, '忘记密码？用恢复码找回'));
@@ -580,6 +637,9 @@ function renderUnlock() {
     startLockoutCountdown(state.lockoutRemaining, unlockBtn, pwd, errDiv);
   } else {
     setTimeout(() => pwd.focus(), 50);
+    if (state.hasSavedPassword && state.biometricsAvailable && state.biometricsEnabled) {
+      setTimeout(() => doBioUnlock(), 180);
+    }
   }
   return container;
 }
@@ -700,6 +760,17 @@ function enterMain() {
   state.sortBy = 'time';
   state.sortAsc = false;
   resetIdleTimer();
+  (async () => {
+    try {
+      const edits = await invoke('list_active_edits');
+      state.activeEdits = new Set(edits.map(x => x.entry_id));
+      state.privacyScreenProtection = await invoke('get_privacy_screen_protection');
+      state.shredSourceEnabled = await invoke('get_shred_source');
+      state.biometricsAvailable = await invoke('is_biometrics_available').catch(() => false);
+      state.biometricsEnabled = await invoke('get_biometrics_enabled').catch(() => true);
+      render();
+    } catch (e) { console.warn(e); }
+  })();
   render();
 }
 
@@ -762,8 +833,14 @@ function renderMain() {
     el('span', {}, '＋ 添加'),
     el('span', { class: 'arrow', html: CHEVRON_DOWN_SVG })
   ]);
+  const panicBtnEl = el('button', {
+    class: 'icon-btn',
+    title: '⚡ 紧急防窥锁屏 (Boss Key: Cmd/Ctrl+Shift+L)，隐藏窗口并立即清空内存主密钥',
+    style: 'color: #ef4444; font-size: 14px; font-weight: bold;',
+    onclick: doPanicLock
+  }, '⚡');
   const lockBtnEl = el('button', { class: 'lock-btn', onclick: doLock }, '🔒 锁定');
-  const right = el('div', { class: 'topbar-right' }, [countLabel, addBtn, multiBtn, gearBtn, lockBtnEl]);
+  const right = el('div', { class: 'topbar-right' }, [countLabel, addBtn, multiBtn, gearBtn, panicBtnEl, lockBtnEl]);
   topbar.append(left, center, right);
 
   // Sort bar (only when there are files)
@@ -958,15 +1035,25 @@ function renderFileItem(entry) {
   }
   row.appendChild(el('div', { class: 'file-icon ' + iconClass }, iconChar));
   const meta = `${category} · ${formatSize(entry.size)} · ${formatDate(entry.added_at)}`;
+  const isEditing = state.activeEdits && state.activeEdits.has(entry.id);
+  const nameChildren = [entry.name];
+  if (isEditing) {
+    nameChildren.push(el('span', { class: 'badge-editing' }, '⚡ 正在编辑中'));
+  }
   row.appendChild(el('div', { class: 'file-info' }, [
-    el('div', { class: 'file-name', title: entry.name }, entry.name),
+    el('div', { class: 'file-name', title: entry.name }, nameChildren),
     el('div', { class: 'file-meta' }, meta)
   ]));
   const actions = el('div', { class: 'file-actions' });
-  const mkBtn = (emoji, title, handler, danger) => actions.appendChild(el('button', {
-    class: 'file-action-btn' + (danger ? ' danger' : ''),
+  const mkBtn = (label, title, handler, danger, extraClass) => actions.appendChild(el('button', {
+    class: 'file-action-btn' + (danger ? ' danger' : '') + (extraClass ? ' ' + extraClass : ''),
     title, onclick: e => { e.stopPropagation(); handler(); }
-  }, emoji));
+  }, label));
+  if (isEditing) {
+    mkBtn('✓ 完成', '完成编辑并安全物理粉碎临时明文', () => finishEntryEdit(entry), false, 'btn-finish-edit');
+  } else if (!isFolder) {
+    mkBtn('⚡', '原地编辑（外部软件保存后自动加密写回）', () => openEntryForEdit(entry));
+  }
   mkBtn('✏️', '重命名', () => showRenameModal(entry));
   mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
   mkBtn('👁', '无痕预览', () => previewOrOpenEntry(entry));
@@ -1105,6 +1192,17 @@ function showPreviewModal(previewData, entry) {
         el('span', { class: 'preview-badge' }, '内存无痕预览 (0 磁盘写入)'),
       ]),
       el('div', { class: 'preview-actions' }, [
+        ...(entry.kind !== 'folder' ? [
+          el('button', {
+            class: 'btn btn-secondary',
+            style: 'padding: 6px 12px; font-size: 12px;',
+            title: '在系统外部应用中编辑，修改保存后自动加密写回',
+            onclick: () => {
+              closeModal();
+              openEntryForEdit(entry);
+            }
+          }, '⚡ 原地编辑')
+        ] : []),
         el('button', {
           class: 'btn btn-ghost',
           style: 'padding: 6px 12px; font-size: 12px;',
@@ -1131,6 +1229,34 @@ function showPreviewModal(previewData, entry) {
 async function openEntry(id) {
   try { await invoke('open_entry', { id }); }
   catch (e) { showError('打开失败: ' + e); }
+}
+
+async function openEntryForEdit(entry) {
+  if (entry.kind === 'folder') {
+    showError('目录暂不支持原地编辑，请使用导出功能');
+    return;
+  }
+  try {
+    showToast(`正在解密并打开「${entry.name}」…`);
+    await invoke('open_entry_for_edit', { id: entry.id });
+    state.activeEdits.add(entry.id);
+    render();
+    showToast(`⚡ 已在外部编辑器打开！修改并保存（Ctrl+S / Cmd+S）后，FileLocker 将自动加密写回。`, 4500);
+  } catch (e) {
+    showError('开启原地编辑失败: ' + e);
+  }
+}
+
+async function finishEntryEdit(entry) {
+  try {
+    await invoke('finish_entry_edit', { id: entry.id });
+    state.activeEdits.delete(entry.id);
+    state.entries = await invoke('list_entries');
+    render();
+    showToast(`✓ 已完成编辑！最新修改已加密入库，临时明文已安全物理粉碎！`);
+  } catch (e) {
+    showError('完成编辑失败: ' + e);
+  }
 }
 
 async function exportEntry(entry) {
@@ -1201,12 +1327,27 @@ async function doLock() {
   hidePrivacyOverlay();
   try { await invoke('lock'); } catch {}
   state.entries = [];
+  state.activeEdits.clear();
   state.selectedIds.clear();
   state.multiSelectMode = false;
   state.searchQuery = '';
   if (state.currentVault) state.currentVault.is_unlocked = false;
   state.screen = 'unlock';
   render();
+}
+
+async function doPanicLock() {
+  hidePrivacyOverlay();
+  try { await invoke('panic_lock'); } catch {}
+  state.entries = [];
+  state.activeEdits.clear();
+  state.selectedIds.clear();
+  state.multiSelectMode = false;
+  state.searchQuery = '';
+  if (state.currentVault) state.currentVault.is_unlocked = false;
+  state.screen = 'unlock';
+  render();
+  showToast('⚡ 紧急防窥锁屏：内存密钥已销毁，窗口已退回后台');
 }
 
 // ---- Drag & Drop into app ----
@@ -1345,6 +1486,7 @@ document.addEventListener('click', e => {
     const entry = state.entries.find(x => x.id === id);
     if (!entry) return;
     if (action === 'preview') previewOrOpenEntry(entry);
+    else if (action === 'edit') openEntryForEdit(entry);
     else if (action === 'open') openEntry(id);
     else if (action === 'rename') showRenameModal(entry);
     else if (action === 'export') exportEntry(entry);
@@ -1386,14 +1528,50 @@ document.addEventListener('click', e => {
   if (gItem) {
     const action = gItem.dataset.action;
     if (action === 'changepw') { hideGearMenu(); showChangePasswordModal(); }
+    else if (action === 'toggle-biometrics') {
+      state.biometricsEnabled = !state.biometricsEnabled;
+      (async () => {
+        try {
+          await invoke('set_biometrics_enabled', { enabled: state.biometricsEnabled });
+          const item = $('#gearBiometricsItem');
+          if (item) item.textContent = `👆 Touch ID 解锁：${state.biometricsEnabled ? '已开启' : '已关闭'}`;
+          showToast(state.biometricsEnabled ? 'Touch ID / 生物识别解锁已开启' : 'Touch ID / 生物识别解锁已关闭');
+        } catch (e) { showError('切换生物识别失败: ' + e); }
+      })();
+      hideGearMenu();
+    }
+    else if (action === 'toggle-screen-shield') {
+      state.privacyScreenProtection = !state.privacyScreenProtection;
+      (async () => {
+        try {
+          await invoke('set_privacy_screen_protection', { enabled: state.privacyScreenProtection });
+          const item = $('#gearScreenShieldItem');
+          if (item) item.textContent = `🛡️ 录屏截屏防窥遮罩：${state.privacyScreenProtection ? '已开启' : '已关闭'}`;
+          showToast(state.privacyScreenProtection ? '录屏截屏防窥遮罩已开启（录屏/投屏中窗口变黑）' : '录屏截屏防窥遮罩已关闭');
+        } catch (e) { showError('切换防窥遮罩失败: ' + e); }
+      })();
+      hideGearMenu();
+    }
+    else if (action === 'toggle-shred-source') {
+      state.shredSourceEnabled = !state.shredSourceEnabled;
+      (async () => {
+        try {
+          await invoke('set_shred_source', { enabled: state.shredSourceEnabled });
+          const item = $('#gearShredSourceItem');
+          if (item) item.textContent = `🔥 导入时物理粉碎原文件：${state.shredSourceEnabled ? '已开启' : '已关闭'}`;
+          showToast(state.shredSourceEnabled ? '导入时物理粉碎原文件已开启' : '导入时原文件移入废纸篓');
+        } catch (e) { showError('设置粉碎选项失败: ' + e); }
+      })();
+      hideGearMenu();
+    }
     else if (action === 'toggle-privacy-blur') {
       state.privacyBlurEnabled = !state.privacyBlurEnabled;
       localStorage.setItem('filelocker_privacy_blur', state.privacyBlurEnabled ? 'true' : 'false');
       const pbItem = $('#gearPrivacyBlurItem');
       if (pbItem) {
-        pbItem.textContent = `🛡️ 窗口防窥保护：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
+        pbItem.textContent = `👁️ 失去焦点防窥模糊：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
       }
-      showToast(state.privacyBlurEnabled ? '防窥保护已开启' : '防窥保护已关闭');
+      showToast(state.privacyBlurEnabled ? '防窥模糊已开启' : '防窥模糊已关闭');
       hideGearMenu();
     }
     else if (action === 'shred-temp') {
@@ -1650,9 +1828,26 @@ function toggleGearMenu(e) {
     it.classList.toggle('active', parseInt(it.dataset.val) === state.autoLockMinutes);
   });
   const menuRect = menu.getBoundingClientRect();
+  const bioItem = $('#gearBiometricsItem');
+  if (bioItem) {
+    if (!state.biometricsAvailable) {
+      bioItem.style.display = 'none';
+    } else {
+      bioItem.style.display = 'block';
+      bioItem.textContent = `👆 Touch ID 解锁：${state.biometricsEnabled ? '已开启' : '已关闭'}`;
+    }
+  }
+  const shieldItem = $('#gearScreenShieldItem');
+  if (shieldItem) {
+    shieldItem.textContent = `🛡️ 录屏截屏防窥遮罩：${state.privacyScreenProtection ? '已开启' : '已关闭'}`;
+  }
+  const shredItem = $('#gearShredSourceItem');
+  if (shredItem) {
+    shredItem.textContent = `🔥 导入时物理粉碎原文件：${state.shredSourceEnabled ? '已开启' : '已关闭'}`;
+  }
   const pbItem = $('#gearPrivacyBlurItem');
   if (pbItem) {
-    pbItem.textContent = `🛡️ 窗口防窥保护：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
+    pbItem.textContent = `👁️ 失去焦点防窥模糊：${state.privacyBlurEnabled ? '已开启' : '已关闭'}`;
   }
   let x = rect.right - menuRect.width;
   let y = rect.bottom + 6;
@@ -1762,6 +1957,8 @@ async function init() {
   render();
   try {
     await loadVaultsInfo();
+    state.biometricsAvailable = await invoke('is_biometrics_available').catch(() => false);
+    state.biometricsEnabled = await invoke('get_biometrics_enabled').catch(() => true);
     const exists = state.currentVault ? state.currentVault.exists : await invoke('vault_exists');
     if (exists) {
       if (state.hasSavedPassword) {
@@ -1774,6 +1971,7 @@ async function init() {
           startIdleMonitor();
           initDragDropListener();
           initAutoLockListener();
+          initAutoSaveListener();
           initOperationProgressListener();
           return;
         } catch (e) {
@@ -1792,6 +1990,7 @@ async function init() {
   startIdleMonitor();
   initDragDropListener();
   initAutoLockListener();
+  initAutoSaveListener();
   initOperationProgressListener();
 }
 
@@ -1801,8 +2000,14 @@ document.addEventListener('keydown', e => {
     hideAllMenus();
     if (state.modalOpen) closeModal();
   }
+  // Cmd/Ctrl+Shift+L for Boss Key (Panic Lock)
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+    e.preventDefault();
+    doPanicLock();
+    return;
+  }
   // Cmd/Ctrl+L to lock
-  if ((e.metaKey || e.ctrlKey) && e.key === 'l' && state.screen === 'main') {
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === 'l' || e.key === 'L') && state.screen === 'main') {
     e.preventDefault();
     doLock();
   }
