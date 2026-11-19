@@ -417,19 +417,51 @@ where
     }
 }
 
+/// 将内存字节切片直接流式分块加密写入目标密文文件（采用标准分块 + AAD 机制）。
+pub fn encrypt_bytes_to_file(data: &[u8], dst: &Path, key: &[u8; KEY_LEN]) -> Result<u64, String> {
+    let writer = File::create(dst).map_err(|e| format!("创建目标密文文件失败: {e}"))?;
+    match encrypt_reader_to_writer(
+        std::io::Cursor::new(data),
+        data.len() as u64,
+        writer,
+        key,
+        |_, _| {},
+    ) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            let _ = std::fs::remove_file(dst);
+            Err(e)
+        }
+    }
+}
+
 fn encrypt_file_stream_inner<F>(
     src: &Path,
     dst: &Path,
     key: &[u8; KEY_LEN],
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<u64, String>
 where
     F: FnMut(u64, u64),
 {
-    let mut reader = File::open(src).map_err(|e| format!("打开源文件失败: {e}"))?;
+    let reader = File::open(src).map_err(|e| format!("打开源文件失败: {e}"))?;
     let total_src_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut writer = File::create(dst).map_err(|e| format!("创建目标密文文件失败: {e}"))?;
+    let writer = File::create(dst).map_err(|e| format!("创建目标密文文件失败: {e}"))?;
+    encrypt_reader_to_writer(reader, total_src_len, writer, key, on_progress)
+}
 
+fn encrypt_reader_to_writer<R, W, F>(
+    mut reader: R,
+    total_src_len: u64,
+    mut writer: W,
+    key: &[u8; KEY_LEN],
+    mut on_progress: F,
+) -> Result<u64, String>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(u64, u64),
+{
     let chunk_size = DEFAULT_CHUNK_SIZE;
     writer
         .write_all(CHUNK_MAGIC)
@@ -458,7 +490,7 @@ where
         while filled < buffer.len() {
             let n = reader
                 .read(&mut buffer[filled..])
-                .map_err(|e| format!("读取源文件失败: {e}"))?;
+                .map_err(|e| format!("读取源数据失败: {e}"))?;
             if n == 0 {
                 break;
             }

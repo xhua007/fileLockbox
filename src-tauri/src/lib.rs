@@ -329,6 +329,47 @@ fn delete_entries(ids: Vec<String>, state: State<VaultState>) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn move_to_trash(ids: Vec<String>, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.move_to_trash(&ids)
+}
+
+#[tauri::command]
+fn restore_from_trash(ids: Vec<String>, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.restore_from_trash(&ids)
+}
+
+#[tauri::command]
+fn permanently_delete_entries(ids: Vec<String>, state: State<VaultState>) -> Result<(), String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.permanently_delete_entries(&ids)
+}
+
+#[tauri::command]
+fn empty_trash(state: State<VaultState>) -> Result<usize, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.empty_trash()
+}
+
+#[tauri::command]
+fn save_note(
+    id: Option<String>,
+    title: String,
+    content: String,
+    state: State<VaultState>,
+) -> Result<models::VaultEntry, String> {
+    let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.save_note(id, &title, &content)
+}
+
+#[tauri::command]
+fn read_note(id: String, state: State<VaultState>) -> Result<String, String> {
+    let v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
+    v.read_note(&id)
+}
+
+#[tauri::command]
 fn change_password(old: String, new: String, state: State<VaultState>) -> Result<String, String> {
     let mut v = state.lock().map_err(|e| format!("状态锁已被污染: {e}"))?;
     v.change_password(&old, &new)
@@ -935,6 +976,12 @@ pub fn run() {
             restore_entry,
             delete_entry,
             delete_entries,
+            move_to_trash,
+            restore_from_trash,
+            permanently_delete_entries,
+            empty_trash,
+            save_note,
+            read_note,
             change_password,
             recover_password,
             temporary_export_url,
@@ -970,6 +1017,24 @@ pub fn run() {
                     // 点击窗口关闭按钮 [X] 时，静默隐藏到系统托盘常驻，避免丢失后台监听
                     let _ = window.hide();
                     api.prevent_close();
+                }
+                tauri::WindowEvent::DragDrop(event) => {
+                    match event {
+                        tauri::DragDropEvent::Drop { paths, .. } => {
+                            let string_paths: Vec<String> = paths
+                                .iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+                            let _ = window.emit("files-drag-dropped", string_paths);
+                        }
+                        tauri::DragDropEvent::Enter { .. } => {
+                            let _ = window.emit("window-drag-entered", ());
+                        }
+                        tauri::DragDropEvent::Leave => {
+                            let _ = window.emit("window-drag-left", ());
+                        }
+                        _ => {}
+                    }
                 }
                 tauri::WindowEvent::Destroyed => {
                     if let Some(state) = window.try_state::<Mutex<VaultManager>>() {

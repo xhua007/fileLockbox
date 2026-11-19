@@ -982,10 +982,66 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  /* 桌面拖拽加密浮层 */
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(0, 122, 255, 0.12);
+    backdrop-filter: blur(10px) saturate(180%);
+    -webkit-backdrop-filter: blur(10px) saturate(180%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 4px dashed var(--primary);
+    pointer-events: none;
+    transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .drop-overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+  }
+  .drop-card {
+    text-align: center;
+    padding: 36px 48px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    box-shadow: 0 20px 48px rgba(0, 122, 255, 0.25);
+  }
+  .drop-icon {
+    font-size: 52px;
+    margin-bottom: 12px;
+    animation: drop-bounce 1.2s infinite ease-in-out;
+  }
+  .drop-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .drop-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  @keyframes drop-bounce {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
+  }
 </style>
 </head>
 <body>
 <div id="app"></div>
+
+<!-- 桌面文件拖拽导入浮层 -->
+<div class="drop-overlay hidden" id="dropOverlay">
+  <div class="drop-card">
+    <div class="drop-icon">📥</div>
+    <div class="drop-title">松开鼠标，立即加密存入保险箱</div>
+    <div class="drop-desc">支持任意格式文件与多级文件夹，自动并发流式分块加密</div>
+  </div>
+</div>
 
 <!-- 防窥隐私遮罩 -->
 <div class="privacy-overlay hidden" id="privacyOverlay">
@@ -1035,6 +1091,7 @@
 <div class="dropdown-menu" id="addMenu">
   <div class="dropdown-item" data-action="add-files">📄 添加文件…</div>
   <div class="dropdown-item" data-action="add-folders">📁 添加文件夹…</div>
+  <div class="dropdown-item" data-action="add-note">📝 新建机密便签…</div>
 </div>
 
 <!-- 保险箱切换菜单 -->

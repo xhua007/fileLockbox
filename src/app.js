@@ -43,6 +43,7 @@ const state = {
   biometricsEnabled: true,
   activeEdits: new Set(),
   pickingFile: false,
+  currentTab: 'files', // 'files' | 'trash'
 };
 
 function hidePrivacyOverlay() {
@@ -108,8 +109,15 @@ function formatDate(ts) {
   }
 }
 
-function getCategory(name) {
+function getCategory(item) {
+  if (typeof item === 'object' && item !== null) {
+    if (item.kind === 'note') return '便签';
+    if (item.kind === 'folder') return '文件夹';
+    item = item.name;
+  }
+  const name = String(item || '');
   const ext = (name.split('.').pop() || '').toLowerCase();
+  if (ext === 'note') return '便签';
   if (['jpg','jpeg','png','gif','bmp','webp','svg','heic','tiff','ico'].includes(ext)) return '图片';
   if (['mp4','mov','avi','mkv','flv','wmv','webm','m4v'].includes(ext)) return '视频';
   if (['mp3','wav','flac','aac','ogg','m4a','wma'].includes(ext)) return '音频';
@@ -843,43 +851,92 @@ function renderMain() {
   const right = el('div', { class: 'topbar-right' }, [countLabel, addBtn, multiBtn, gearBtn, panicBtnEl, lockBtnEl]);
   topbar.append(left, center, right);
 
-  // Sort bar (only when there are files)
-  const sortBar = el('div', { class: 'sort-bar', id: 'sortBar', style: totalCount > 0 ? '' : 'display:none;' });
-  sortBar.append(el('span', { class: 'sort-label' }, '排序：'));
-  const segGroup = el('div', { class: 'seg-group' });
-  for (const [key, label] of [['category','分类'],['time','时间'],['size','大小']]) {
-    segGroup.appendChild(el('button', {
-      class: 'seg-btn' + (state.sortBy === key ? ' active' : ''),
-      onclick: () => {
-        if (state.sortBy === key) state.sortAsc = !state.sortAsc;
-        else { state.sortBy = key; state.sortAsc = false; }
-        render();
-      }
-    }, label));
+  // Sort and Tab bar
+  const sortBar = el('div', { class: 'sort-bar', id: 'sortBar' });
+
+  // Tab Switcher: 📁 全部文件 vs 🗑 回收站
+  const activeCount = state.entries.filter(e => !e.is_deleted).length;
+  const trashCount = state.entries.filter(e => !!e.is_deleted).length;
+  const isTrash = state.currentTab === 'trash';
+
+  const tabGroup = el('div', { class: 'seg-group', style: 'margin-right: 10px;' });
+  tabGroup.appendChild(el('button', {
+    class: 'seg-btn' + (!isTrash ? ' active' : ''),
+    onclick: () => {
+      state.currentTab = 'files';
+      state.selectedIds.clear();
+      render();
+    }
+  }, `📁 文件 (${activeCount})`));
+
+  tabGroup.appendChild(el('button', {
+    class: 'seg-btn' + (isTrash ? ' active' : ''),
+    style: trashCount > 0 ? 'color: var(--danger); font-weight: 500;' : '',
+    onclick: () => {
+      state.currentTab = 'trash';
+      state.selectedIds.clear();
+      render();
+    }
+  }, `🗑 回收站 (${trashCount})`));
+  sortBar.appendChild(tabGroup);
+
+  if (!isTrash && totalCount > 0) {
+    sortBar.append(el('span', { class: 'sort-label' }, '排序：'));
+    const segGroup = el('div', { class: 'seg-group' });
+    for (const [key, label] of [['category','分类'],['time','时间'],['size','大小']]) {
+      segGroup.appendChild(el('button', {
+        class: 'seg-btn' + (state.sortBy === key ? ' active' : ''),
+        onclick: () => {
+          if (state.sortBy === key) state.sortAsc = !state.sortAsc;
+          else { state.sortBy = key; state.sortAsc = false; }
+          render();
+        }
+      }, label));
+    }
+    sortBar.appendChild(segGroup);
+    sortBar.appendChild(el('button', {
+      class: 'icon-btn',
+      title: state.sortAsc ? '升序' : '降序',
+      style: 'margin-left:4px;width:28px;height:28px;font-size:13px;',
+      onclick: () => { state.sortAsc = !state.sortAsc; render(); }
+    }, state.sortAsc ? '↑' : '↓'));
+  } else if (isTrash && trashCount > 0) {
+    const emptyBtn = el('button', {
+      class: 'btn btn-outline',
+      style: 'margin-left: auto; color: var(--danger); font-size: 12px; padding: 4px 10px;',
+      onclick: emptyTrashAction
+    }, '🧹 清空回收站');
+    sortBar.appendChild(emptyBtn);
   }
-  sortBar.appendChild(segGroup);
-  sortBar.appendChild(el('button', {
-    class: 'icon-btn',
-    title: state.sortAsc ? '升序' : '降序',
-    style: 'margin-left:4px;width:28px;height:28px;font-size:13px;',
-    onclick: () => { state.sortAsc = !state.sortAsc; render(); }
-  }, state.sortAsc ? '↑' : '↓'));
 
   // Action bar
   const actionBar = el('div', {
     class: 'action-bar',
     style: state.multiSelectMode && selectedCount > 0 ? '' : 'display:none;'
   });
-  actionBar.append(
-    el('span', {}, `已选 ${selectedCount} 项`),
-    el('div', { class: 'action-bar-spacer' }),
-    el('button', { class: 'btn btn-danger', onclick: deleteSelected }, '🗑 删除'),
-    el('button', { class: 'btn btn-outline', onclick: exportSelected }, '⤴ 导出'),
-    el('button', {
-      class: 'btn btn-ghost',
-      onclick: () => { state.selectedIds.clear(); render(); }
-    }, '取消选择')
-  );
+  if (isTrash) {
+    actionBar.append(
+      el('span', {}, `已选 ${selectedCount} 项`),
+      el('div', { class: 'action-bar-spacer' }),
+      el('button', { class: 'btn btn-secondary', onclick: restoreSelectedFromTrash }, '↩ 还原选中项'),
+      el('button', { class: 'btn btn-danger', onclick: permanentlyDeleteSelected }, '💥 彻底粉碎'),
+      el('button', {
+        class: 'btn btn-ghost',
+        onclick: () => { state.selectedIds.clear(); render(); }
+      }, '取消选择')
+    );
+  } else {
+    actionBar.append(
+      el('span', {}, `已选 ${selectedCount} 项`),
+      el('div', { class: 'action-bar-spacer' }),
+      el('button', { class: 'btn btn-danger', onclick: moveSelectedToTrash }, '🗑 移入回收站'),
+      el('button', { class: 'btn btn-outline', onclick: exportSelected }, '⤴ 导出'),
+      el('button', {
+        class: 'btn btn-ghost',
+        onclick: () => { state.selectedIds.clear(); render(); }
+      }, '取消选择')
+    );
+  }
 
   const listContainer = el('div', { class: 'list-container', id: 'listContainer' });
   let totalBytes = 0;
@@ -897,18 +954,20 @@ function renderMain() {
 function updateCountLabel() {
   const label = $('#countLabel');
   if (!label) return;
-  const total = state.entries.length;
+  const isTrash = state.currentTab === 'trash';
+  const total = state.entries.filter(e => isTrash ? !!e.is_deleted : !e.is_deleted).length;
   const sel = state.selectedIds.size;
-  label.textContent = state.multiSelectMode && sel > 0 ? `已选 ${sel}/${total}` : `共 ${total} 项`;
+  label.textContent = state.multiSelectMode && sel > 0 ? `已选 ${sel}/${total}` : `${isTrash ? '回收站 ' : '共 '}${total} 项`;
 }
 
 function applyFilterAndSort() {
-  let list = state.entries.slice();
+  const isTrash = state.currentTab === 'trash';
+  let list = state.entries.filter(e => isTrash ? !!e.is_deleted : !e.is_deleted);
   const q = state.searchQuery.trim().toLowerCase();
   if (q) {
     list = list.filter(e => {
       if (e.name.toLowerCase().includes(q)) return true;
-      if (getCategory(e.name).toLowerCase().includes(q)) return true;
+      if (getCategory(e).toLowerCase().includes(q)) return true;
       if (e.original_path && e.original_path.toLowerCase().includes(q)) return true;
       return false;
     });
@@ -916,12 +975,14 @@ function applyFilterAndSort() {
   list.sort((a, b) => {
     let cmp = 0;
     if (state.sortBy === 'category') {
-      cmp = getCategory(a.name).localeCompare(getCategory(b.name), 'zh-CN');
+      cmp = getCategory(a).localeCompare(getCategory(b), 'zh-CN');
       if (cmp === 0) cmp = a.name.localeCompare(b.name, 'zh-CN');
     } else if (state.sortBy === 'size') {
-      cmp = a.size - b.size;
+      cmp = (a.size || 0) - (b.size || 0);
     } else {
-      cmp = a.added_at - b.added_at;
+      const timeA = isTrash && a.deleted_at ? a.deleted_at : (a.added_at || 0);
+      const timeB = isTrash && b.deleted_at ? b.deleted_at : (b.added_at || 0);
+      cmp = timeA - timeB;
     }
     return state.sortAsc ? cmp : -cmp;
   });
@@ -934,23 +995,40 @@ const VIRTUAL_BUFFER = 6;
 function renderListInto(container) {
   container.innerHTML = '';
   applyFilterAndSort();
-  if (state.entries.length === 0) {
-    const chooseFileBtn = el('button', {
-      class: 'btn btn-primary',
-      style: 'width:auto;',
-      onclick: () => chooseAndAdd(false)
-    }, '📄 选择文件存入');
-    const chooseFolderBtn = el('button', {
-      class: 'btn btn-outline',
-      style: 'width:auto;',
-      onclick: () => chooseAndAdd(true)
-    }, '📁 选择文件夹存入');
-    container.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-icon' }, '🛡️'),
-      el('div', { class: 'empty-text' }, '拖拽文件或文件夹到此处加密存入'),
-      el('div', { class: 'empty-sub' }, '文件将被 AES-256-GCM 流式分块加密，仅可通过密码访问'),
-      el('div', { style: 'display:flex;gap:10px;margin-top:16px;' }, [chooseFileBtn, chooseFolderBtn])
-    ]));
+
+  const isTrash = state.currentTab === 'trash';
+  const hasEntriesInTab = state.entries.some(e => isTrash ? !!e.is_deleted : !e.is_deleted);
+
+  if (!hasEntriesInTab) {
+    if (isTrash) {
+      container.appendChild(el('div', { class: 'empty-state' }, [
+        el('div', { class: 'empty-icon' }, '🗑️'),
+        el('div', { class: 'empty-text' }, '回收站为空'),
+        el('div', { class: 'empty-sub' }, '移入回收站的文件将在此暂存，支持随时一键还原或彻底物理粉碎')
+      ]));
+    } else {
+      const chooseFileBtn = el('button', {
+        class: 'btn btn-primary',
+        style: 'width:auto;',
+        onclick: () => chooseAndAdd(false)
+      }, '📄 选择文件存入');
+      const chooseFolderBtn = el('button', {
+        class: 'btn btn-outline',
+        style: 'width:auto;',
+        onclick: () => chooseAndAdd(true)
+      }, '📁 选择文件夹存入');
+      const createNoteBtn = el('button', {
+        class: 'btn btn-secondary',
+        style: 'width:auto;',
+        onclick: () => openNoteModal()
+      }, '📝 新建机密便签');
+      container.appendChild(el('div', { class: 'empty-state' }, [
+        el('div', { class: 'empty-icon' }, '🛡️'),
+        el('div', { class: 'empty-text' }, '拖拽文件或文件夹到此处加密存入'),
+        el('div', { class: 'empty-sub' }, '文件将被 ChaCha20-Poly1305 流式分块加密，仅可通过密码访问'),
+        el('div', { style: 'display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;justify-content:center;' }, [chooseFileBtn, chooseFolderBtn, createNoteBtn])
+      ]));
+    }
     return;
   }
   if (state.filteredEntries.length === 0) {
@@ -1010,12 +1088,15 @@ function renderListInto(container) {
 }
 
 function renderFileItem(entry) {
+  const isTrash = state.currentTab === 'trash';
   const isFolder = entry.kind === 'folder';
+  const isNote = entry.kind === 'note';
   const isSelected = state.selectedIds.has(entry.id);
-  const category = getCategory(entry.name);
+  const category = getCategory(entry);
   let iconClass = 'other';
   let iconChar = '📄';
-  if (isFolder) { iconClass = 'folder'; iconChar = '📁'; }
+  if (isNote) { iconClass = 'document'; iconChar = '📝'; }
+  else if (isFolder) { iconClass = 'folder'; iconChar = '📁'; }
   else if (category === '图片') { iconClass = 'image'; iconChar = '🖼️'; }
   else if (category === '视频' || category === '音频') { iconClass = 'media'; iconChar = '🎬'; }
   else if (category === '文档') { iconClass = 'document'; iconChar = '📄'; }
@@ -1034,31 +1115,49 @@ function renderFileItem(entry) {
     }, isSelected ? '✓' : ''));
   }
   row.appendChild(el('div', { class: 'file-icon ' + iconClass }, iconChar));
-  const meta = `${category} · ${formatSize(entry.size)} · ${formatDate(entry.added_at)}`;
+
+  const meta = isTrash && entry.deleted_at
+    ? `${category} · ${formatSize(entry.size)} · 删除于 ${formatDate(entry.deleted_at)}`
+    : `${category} · ${formatSize(entry.size)} · ${formatDate(entry.added_at)}`;
   const isEditing = state.activeEdits && state.activeEdits.has(entry.id);
-  const nameChildren = [entry.name];
+  const displayName = isNote ? entry.name.replace(/\.note$/, '') : entry.name;
+  const nameChildren = [displayName];
   if (isEditing) {
     nameChildren.push(el('span', { class: 'badge-editing' }, '⚡ 正在编辑中'));
+  }
+  if (isNote) {
+    nameChildren.push(el('span', { class: 'preview-badge', style: 'margin-left:6px;font-size:10px;padding:1px 6px;' }, '机密便签'));
   }
   row.appendChild(el('div', { class: 'file-info' }, [
     el('div', { class: 'file-name', title: entry.name }, nameChildren),
     el('div', { class: 'file-meta' }, meta)
   ]));
+
   const actions = el('div', { class: 'file-actions' });
   const mkBtn = (label, title, handler, danger, extraClass) => actions.appendChild(el('button', {
     class: 'file-action-btn' + (danger ? ' danger' : '') + (extraClass ? ' ' + extraClass : ''),
     title, onclick: e => { e.stopPropagation(); handler(); }
   }, label));
-  if (isEditing) {
-    mkBtn('✓ 完成', '完成编辑并安全物理粉碎临时明文', () => finishEntryEdit(entry), false, 'btn-finish-edit');
-  } else if (!isFolder) {
-    mkBtn('⚡', '原地编辑（外部软件保存后自动加密写回）', () => openEntryForEdit(entry));
+
+  if (isTrash) {
+    mkBtn('↩', '还原条目到全部文件', () => restoreFromTrash(entry.id));
+    mkBtn('💥', '彻底物理粉碎（不可恢复）', () => permanentlyDeleteEntry(entry), true);
+  } else {
+    if (isNote) {
+      mkBtn('✏️', '查看与编辑便签', () => openNoteModal(entry));
+    } else {
+      if (isEditing) {
+        mkBtn('✓ 完成', '完成编辑并安全物理粉碎临时明文', () => finishEntryEdit(entry), false, 'btn-finish-edit');
+      } else if (!isFolder) {
+        mkBtn('⚡', '原地编辑（外部软件保存后自动加密写回）', () => openEntryForEdit(entry));
+      }
+      mkBtn('✏️', '重命名', () => showRenameModal(entry));
+    }
+    mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
+    mkBtn('👁', '无痕预览', () => previewOrOpenEntry(entry));
+    mkBtn('⤴', '导出', () => exportEntry(entry));
+    mkBtn('🗑', '移入回收站', () => moveToTrash(entry), true);
   }
-  mkBtn('✏️', '重命名', () => showRenameModal(entry));
-  mkBtn('↩', '还原到原位置', () => restoreEntry(entry.id));
-  mkBtn('👁', '无痕预览', () => previewOrOpenEntry(entry));
-  mkBtn('⤴', '导出', () => exportEntry(entry));
-  mkBtn('🗑', '删除', () => deleteEntry(entry), true);
   row.appendChild(actions);
 
   row.addEventListener('click', e => {
@@ -1074,7 +1173,12 @@ function renderFileItem(entry) {
   });
   row.addEventListener('dblclick', e => {
     if (e.target.closest('.file-actions') || e.target.closest('.file-checkbox')) return;
-    previewOrOpenEntry(entry);
+    if (isTrash) return;
+    if (isNote) {
+      openNoteModal(entry);
+    } else {
+      previewOrOpenEntry(entry);
+    }
   });
   row.addEventListener('contextmenu', e => {
     e.preventDefault();
@@ -1296,31 +1400,225 @@ async function restoreEntry(id) {
   } catch (e) { showError('还原失败: ' + e); }
 }
 
-async function deleteEntry(entry) {
-  showConfirm(`确定要删除「${entry.name}」吗？密文文件会从保险箱中移除，删除后不可恢复。`, async () => {
+async function moveToTrash(entry) {
+  try {
+    await invoke('move_to_trash', { ids: [entry.id] });
+    state.entries = await invoke('list_entries');
+    state.selectedIds.delete(entry.id);
+    showToast('已移入回收站（可随时在回收站还原）');
+    render();
+  } catch (e) {
+    showError('移入回收站失败: ' + e);
+  }
+}
+
+async function moveSelectedToTrash() {
+  const ids = Array.from(state.selectedIds);
+  if (ids.length === 0) return;
+  try {
+    await invoke('move_to_trash', { ids });
+    state.entries = await invoke('list_entries');
+    state.selectedIds.clear();
+    state.multiSelectMode = false;
+    showToast(`已将 ${ids.length} 项移入回收站`);
+    render();
+  } catch (e) {
+    showError('移入回收站失败: ' + e);
+  }
+}
+
+async function restoreFromTrash(id) {
+  try {
+    await invoke('restore_from_trash', { ids: [id] });
+    state.entries = await invoke('list_entries');
+    state.selectedIds.delete(id);
+    showToast('已还原到全部文件');
+    render();
+  } catch (e) {
+    showError('还原失败: ' + e);
+  }
+}
+
+async function restoreSelectedFromTrash() {
+  const ids = Array.from(state.selectedIds);
+  if (ids.length === 0) return;
+  try {
+    await invoke('restore_from_trash', { ids });
+    state.entries = await invoke('list_entries');
+    state.selectedIds.clear();
+    state.multiSelectMode = false;
+    showToast(`已还原 ${ids.length} 项`);
+    render();
+  } catch (e) {
+    showError('还原失败: ' + e);
+  }
+}
+
+async function permanentlyDeleteEntry(entry) {
+  showConfirm(`确定要彻底物理粉碎「${entry.name}」吗？文件将使用 DoD 3 遍标准安全覆写擦除，彻底无法恢复！`, async () => {
     try {
-      await invoke('delete_entry', { id: entry.id });
+      await invoke('permanently_delete_entries', { ids: [entry.id] });
       state.entries = await invoke('list_entries');
       state.selectedIds.delete(entry.id);
-      showToast('已删除，密文文件已移除');
+      showToast('已彻底物理粉碎');
       render();
-    } catch (e) { showError('删除失败: ' + e); }
+    } catch (e) {
+      showError('粉碎失败: ' + e);
+    }
   });
 }
 
-async function deleteSelected() {
+async function permanentlyDeleteSelected() {
   const ids = Array.from(state.selectedIds);
   if (ids.length === 0) return;
-  showConfirm(`确定要删除选中的 ${ids.length} 项吗？密文文件会从保险箱中移除，删除后不可恢复。`, async () => {
+  showConfirm(`确定要彻底物理粉碎选中的 ${ids.length} 项吗？数据将被擦除且不可恢复！`, async () => {
     try {
-      await invoke('delete_entries', { ids });
+      await invoke('permanently_delete_entries', { ids });
       state.entries = await invoke('list_entries');
       state.selectedIds.clear();
       state.multiSelectMode = false;
-      showToast('已删除，密文文件已移除');
+      showToast(`已彻底物理粉碎 ${ids.length} 项`);
       render();
-    } catch (e) { showError('删除失败: ' + e); }
+    } catch (e) {
+      showError('粉碎失败: ' + e);
+    }
   });
+}
+
+async function emptyTrashAction() {
+  const trashItems = state.entries.filter(e => e.is_deleted);
+  if (trashItems.length === 0) return;
+  showConfirm(`确定要清空回收站吗？回收站内的 ${trashItems.length} 个项目都将被彻底物理擦除，无法恢复！`, async () => {
+    try {
+      const purged = await invoke('empty_trash');
+      state.entries = await invoke('list_entries');
+      state.selectedIds.clear();
+      showToast(`已清空回收站，彻底粉碎 ${purged} 项`);
+      render();
+    } catch (e) {
+      showError('清空回收站失败: ' + e);
+    }
+  });
+}
+
+function openNoteModal(entry = null) {
+  let noteTitle = '';
+  let noteId = null;
+
+  if (entry && entry.kind === 'note') {
+    noteId = entry.id;
+    noteTitle = entry.name.replace(/\.note$/, '');
+  }
+
+  const overlay = el('div', { class: 'modal-overlay' });
+  const modal = el('div', { class: 'modal', style: 'max-width: 580px; width: 92%;' });
+
+  const titleInput = el('input', {
+    class: 'form-input',
+    style: 'font-weight: 600; font-size: 15px; margin-bottom: 10px;',
+    placeholder: '便签标题（如：服务器密钥、助记词、备忘录）',
+    value: noteTitle
+  });
+
+  const contentTextarea = el('textarea', {
+    class: 'form-input',
+    style: 'height: 220px; font-family: monospace; font-size: 13px; line-height: 1.6; resize: vertical; margin-bottom: 8px;',
+    placeholder: '在此输入机密文字内容（将直接在内存中强加密后存入保险箱，0 磁盘明文残留）…'
+  });
+
+  const wordCountLabel = el('span', { style: 'font-size: 12px; color: var(--text-secondary);' }, '0 字符');
+  const updateStats = () => {
+    const len = contentTextarea.value.length;
+    wordCountLabel.textContent = `${len} 字符`;
+  };
+  contentTextarea.addEventListener('input', updateStats);
+
+  if (noteId) {
+    contentTextarea.value = '正在安全解密便签内容…';
+    contentTextarea.disabled = true;
+    invoke('read_note', { id: noteId })
+      .then(text => {
+        contentTextarea.value = text;
+        contentTextarea.disabled = false;
+        updateStats();
+      })
+      .catch(e => {
+        contentTextarea.value = '读取便签失败: ' + e;
+      });
+  }
+
+  const copyBtn = el('button', {
+    class: 'btn btn-secondary',
+    style: 'font-size: 12px; padding: 4px 10px;',
+    title: '复制机密文本，并在 30 秒后自动清空剪贴板',
+    onclick: async () => {
+      const val = contentTextarea.value;
+      if (!val) return;
+      try {
+        await invoke('copy_sensitive_text', { text: val });
+        showToast('已隐蔽复制（30秒后自动清空剪贴板）');
+      } catch (e) {
+        showError('复制失败: ' + e);
+      }
+    }
+  }, '📋 隐蔽复制');
+
+  const cancelBtn = el('button', {
+    class: 'btn btn-outline',
+    onclick: () => overlay.remove()
+  }, '取消');
+
+  const saveBtn = el('button', {
+    class: 'btn btn-primary',
+    onclick: async () => {
+      const title = titleInput.value.trim() || '无标题便签';
+      const content = contentTextarea.value;
+      try {
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中…';
+        await invoke('save_note', { id: noteId, title, content });
+        state.entries = await invoke('list_entries');
+        showToast(noteId ? '便签已更新并加密' : '机密便签已加密保存');
+        overlay.remove();
+        render();
+      } catch (e) {
+        showError('保存便签失败: ' + e);
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存便签';
+      }
+    }
+  }, '💾 保存便签');
+
+  const header = el('div', { style: 'display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;' }, [
+    el('div', { class: 'modal-title' }, noteId ? '📝 编辑机密便签' : '📝 新建机密便签'),
+    copyBtn
+  ]);
+
+  const footer = el('div', { class: 'modal-actions', style: 'display:flex; justify-content:space-between; align-items:center; margin-top: 14px;' }, [
+    wordCountLabel,
+    el('div', { style: 'display:flex; gap: 8px;' }, [cancelBtn, saveBtn])
+  ]);
+
+  modal.append(header, titleInput, contentTextarea, footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  if (!noteId) titleInput.focus();
+}
+
+async function deleteEntry(entry) {
+  if (entry.is_deleted) {
+    permanentlyDeleteEntry(entry);
+  } else {
+    moveToTrash(entry);
+  }
+}
+
+async function deleteSelected() {
+  if (state.currentTab === 'trash') {
+    permanentlyDeleteSelected();
+  } else {
+    moveSelectedToTrash();
+  }
 }
 
 async function doLock() {
@@ -1385,9 +1683,41 @@ function setupDragDrop() {
   });
 }
 
+function showDropOverlay() {
+  const overlay = $('#dropOverlay');
+  if (overlay) overlay.classList.remove('hidden');
+}
+
+function hideDropOverlay() {
+  const overlay = $('#dropOverlay');
+  if (overlay) overlay.classList.add('hidden');
+}
+
 async function initDragDropListener() {
   try {
+    await listen('window-drag-entered', () => {
+      if (state.screen === 'main' && state.currentVault && state.currentVault.is_unlocked) {
+        showDropOverlay();
+      }
+    });
+
+    await listen('window-drag-left', () => {
+      hideDropOverlay();
+    });
+
+    await listen('files-drag-dropped', async event => {
+      hideDropOverlay();
+      if (state.screen !== 'main' || !state.currentVault || !state.currentVault.is_unlocked) {
+        showToast('请先解锁保险箱后再拖入文件');
+        return;
+      }
+      const raw = Array.isArray(event.payload) ? event.payload : [];
+      if (raw.length === 0) return;
+      await addFilesByPaths(raw);
+    });
+
     await listen('tauri://drag-drop', async event => {
+      hideDropOverlay();
       let raw = [];
       if (Array.isArray(event.payload)) {
         raw = event.payload;
@@ -1486,12 +1816,21 @@ document.addEventListener('click', e => {
     const entry = state.entries.find(x => x.id === id);
     if (!entry) return;
     if (action === 'preview') previewOrOpenEntry(entry);
-    else if (action === 'edit') openEntryForEdit(entry);
+    else if (action === 'edit') {
+      if (entry.kind === 'note') openNoteModal(entry);
+      else openEntryForEdit(entry);
+    }
     else if (action === 'open') openEntry(id);
     else if (action === 'rename') showRenameModal(entry);
     else if (action === 'export') exportEntry(entry);
-    else if (action === 'restore') restoreEntry(id);
-    else if (action === 'delete') deleteEntry(entry);
+    else if (action === 'restore') {
+      if (entry.is_deleted) restoreFromTrash(id);
+      else restoreEntry(id);
+    }
+    else if (action === 'delete') {
+      if (entry.is_deleted) permanentlyDeleteEntry(entry);
+      else moveToTrash(entry);
+    }
     return;
   }
   if (!e.target.closest('#contextMenu')) hideContextMenu();
@@ -1502,6 +1841,7 @@ document.addEventListener('click', e => {
     hideAddMenu();
     if (act === 'add-files') chooseAndAdd(false);
     else if (act === 'add-folders') chooseAndAdd(true);
+    else if (act === 'add-note') openNoteModal();
     return;
   }
   if (!e.target.closest('#addMenu') && !e.target.closest('#addBtn')) hideAddMenu();

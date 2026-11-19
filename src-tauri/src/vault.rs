@@ -1524,6 +1524,8 @@ impl VaultManager {
                 kind: item.kind,
                 original_path: Some(item.p_str),
                 cipher_path: item.blob_name,
+                is_deleted: false,
+                deleted_at: None,
             };
             added.push(entry);
 
@@ -1613,6 +1615,20 @@ impl VaultManager {
                 mime_type: "application/x-directory".to_string(),
                 data_base64: None,
                 text_content: None,
+                size: entry.size,
+            });
+        }
+
+        if entry.kind == "note" {
+            let bytes = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            return Ok(crate::models::EntryPreviewData {
+                id: entry.id,
+                name: entry.name,
+                kind: "text".to_string(),
+                mime_type: "text/markdown".to_string(),
+                data_base64: None,
+                text_content: Some(text),
                 size: entry.size,
             });
         }
@@ -1941,15 +1957,85 @@ impl VaultManager {
 
     pub fn delete_entry(&mut self, id: &str) -> Result<(), String> {
         self.require_unlocked()?;
-        if !self.entries.iter().any(|e| e.id == id) {
-            return Err("条目不存在".to_string());
+        let is_in_trash = {
+            let entry = self
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| "条目不存在".to_string())?;
+            entry.is_deleted
+        };
+
+        if !is_in_trash {
+            self.move_to_trash(&[id.to_string()])
+        } else {
+            self.delete_stored_entry(id);
+            self.save_index()?;
+            Ok(())
         }
-        self.delete_stored_entry(id);
-        self.save_index()?;
-        Ok(())
     }
 
     pub fn delete_entries(&mut self, ids: &[String]) -> Result<(), String> {
+        self.require_unlocked()?;
+        let mut to_trash = Vec::new();
+        let mut to_shred = Vec::new();
+
+        for entry in &self.entries {
+            if ids.contains(&entry.id) {
+                if entry.is_deleted {
+                    to_shred.push(entry.id.clone());
+                } else {
+                    to_trash.push(entry.id.clone());
+                }
+            }
+        }
+
+        if !to_trash.is_empty() {
+            self.move_to_trash(&to_trash)?;
+        }
+        if !to_shred.is_empty() {
+            self.permanently_delete_entries(&to_shred)?;
+        }
+        Ok(())
+    }
+
+    /// 移入回收站（软删除，数据继续加密保留）
+    pub fn move_to_trash(&mut self, ids: &[String]) -> Result<(), String> {
+        self.require_unlocked()?;
+        let now = Utc::now().timestamp_millis();
+        let mut changed = false;
+        for entry in self.entries.iter_mut() {
+            if ids.contains(&entry.id) && !entry.is_deleted {
+                entry.is_deleted = true;
+                entry.deleted_at = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_index()?;
+        }
+        Ok(())
+    }
+
+    /// 从回收站还原条目
+    pub fn restore_from_trash(&mut self, ids: &[String]) -> Result<(), String> {
+        self.require_unlocked()?;
+        let mut changed = false;
+        for entry in self.entries.iter_mut() {
+            if ids.contains(&entry.id) && entry.is_deleted {
+                entry.is_deleted = false;
+                entry.deleted_at = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_index()?;
+        }
+        Ok(())
+    }
+
+    /// 彻底物理粉碎指定条目（从磁盘擦除）
+    pub fn permanently_delete_entries(&mut self, ids: &[String]) -> Result<(), String> {
         self.require_unlocked()?;
         for id in ids {
             self.delete_stored_entry(id);
@@ -1958,11 +2044,103 @@ impl VaultManager {
         Ok(())
     }
 
+    /// 一键清空回收站中全部条目（彻底物理粉碎）
+    pub fn empty_trash(&mut self) -> Result<usize, String> {
+        self.require_unlocked()?;
+        let trash_ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_deleted)
+            .map(|e| e.id.clone())
+            .collect();
+        let count = trash_ids.len();
+        for id in &trash_ids {
+            self.delete_stored_entry(id);
+        }
+        if count > 0 {
+            self.save_index()?;
+        }
+        Ok(count)
+    }
+
+    /// 新建或更新机密便签（Secure Note）
+    pub fn save_note(
+        &mut self,
+        id: Option<String>,
+        title: &str,
+        content: &str,
+    ) -> Result<VaultEntry, String> {
+        let mk = self.require_unlocked()?;
+        let trimmed_title = title.trim();
+        let display_title = if trimmed_title.is_empty() {
+            "无标题便签"
+        } else {
+            trimmed_title
+        };
+
+        let note_bytes = content.as_bytes();
+        let note_size = note_bytes.len() as u64;
+
+        if let Some(target_id) = id {
+            let pos = self
+                .entries
+                .iter()
+                .position(|e| e.id == target_id)
+                .ok_or_else(|| "便签不存在".to_string())?;
+
+            let blob_path = self.data_dir.join(&self.entries[pos].cipher_path);
+            crypto::encrypt_bytes_to_file(note_bytes, &blob_path, &mk)?;
+
+            let entry = &mut self.entries[pos];
+            entry.name = format!("{display_title}.note");
+            entry.size = note_size;
+            let updated = entry.clone();
+            self.save_index()?;
+            Ok(updated)
+        } else {
+            let new_id = Uuid::new_v4().to_string();
+            let blob_name = format!("{new_id}.bin");
+            let blob_path = self.data_dir.join(&blob_name);
+
+            crypto::encrypt_bytes_to_file(note_bytes, &blob_path, &mk)?;
+
+            let entry = VaultEntry {
+                id: new_id,
+                name: format!("{display_title}.note"),
+                size: note_size,
+                added_at: Utc::now().timestamp_millis(),
+                kind: "note".into(),
+                original_path: None,
+                cipher_path: blob_name,
+                is_deleted: false,
+                deleted_at: None,
+            };
+            self.entries.push(entry.clone());
+            self.save_index()?;
+            Ok(entry)
+        }
+    }
+
+    /// 读取机密便签明文文本
+    pub fn read_note(&self, id: &str) -> Result<String, String> {
+        let mk = self.require_unlocked()?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| "条目不存在".to_string())?;
+
+        let blob_path = self.data_dir.join(&entry.cipher_path);
+        let bytes = crypto::decrypt_file_to_bytes(&blob_path, &mk)?;
+        String::from_utf8(bytes).map_err(|e| format!("便签文本编码错误: {e}"))
+    }
+
     fn delete_stored_entry(&mut self, id: &str) {
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let entry = self.entries.remove(pos);
             let blob = self.data_dir.join(&entry.cipher_path);
             let _ = best_effort_erase_file(&blob);
+            let _ = self.finish_entry_edit(id);
         }
     }
 
@@ -2798,6 +2976,8 @@ mod tests {
             kind: "file".into(),
             original_path: None,
             cipher_path: "blob1.bin".into(),
+            is_deleted: false,
+            deleted_at: None,
         });
         vm.save_index().unwrap();
 
@@ -2854,6 +3034,8 @@ mod tests {
             kind: "file".into(),
             original_path: None,
             cipher_path: "blob.bin".into(),
+            is_deleted: false,
+            deleted_at: None,
         });
         vm.save_index().unwrap();
 
@@ -2867,6 +3049,8 @@ mod tests {
             kind: "file".into(),
             original_path: None,
             cipher_path: "blob2.bin".into(),
+            is_deleted: false,
+            deleted_at: None,
         });
         vm.save_index().unwrap();
 
@@ -3483,6 +3667,101 @@ mod tests {
 
         let reloaded_cfg = load_config(&vm.config_path).unwrap();
         assert_eq!(reloaded_cfg.biometrics_enabled, Some(true));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_vault_trash_lifecycle() {
+        let base = tmp_base("trash_test");
+        let mut vm = make_test_vm(&base, "vault-trash");
+        vm.master_key = Some(crypto::ProtectedMasterKey::new([8u8; 32]));
+        vm.is_unlocked = true;
+
+        let f1 = base.join("f1.txt");
+        let f2 = base.join("f2.txt");
+        fs::write(&f1, "Document 1 content").unwrap();
+        fs::write(&f2, "Document 2 content").unwrap();
+
+        let added = vm
+            .add_files(vec![
+                f1.to_string_lossy().to_string(),
+                f2.to_string_lossy().to_string(),
+            ])
+            .unwrap();
+        assert_eq!(added.len(), 2);
+        let id1 = added[0].id.clone();
+        let id2 = added[1].id.clone();
+
+        // 初始状态：未删除
+        assert!(!vm.entries.iter().find(|e| e.id == id1).unwrap().is_deleted);
+        assert!(!vm.entries.iter().find(|e| e.id == id2).unwrap().is_deleted);
+
+        // 移入回收站
+        vm.move_to_trash(&[id1.clone()]).unwrap();
+        assert!(vm.entries.iter().find(|e| e.id == id1).unwrap().is_deleted);
+        assert!(vm.entries.iter().find(|e| e.id == id1).unwrap().deleted_at.is_some());
+        assert!(!vm.entries.iter().find(|e| e.id == id2).unwrap().is_deleted);
+
+        // 密文仍然完整存在
+        let blob1 = vm.data_dir.join(&vm.entries.iter().find(|e| e.id == id1).unwrap().cipher_path);
+        assert!(blob1.exists());
+
+        // 从回收站还原
+        vm.restore_from_trash(&[id1.clone()]).unwrap();
+        assert!(!vm.entries.iter().find(|e| e.id == id1).unwrap().is_deleted);
+        assert!(vm.entries.iter().find(|e| e.id == id1).unwrap().deleted_at.is_none());
+
+        // 再次移入回收站后一键清空回收站
+        vm.move_to_trash(&[id1.clone()]).unwrap();
+        let purged = vm.empty_trash().unwrap();
+        assert_eq!(purged, 1);
+        assert!(!blob1.exists(), "清空回收站后密文文件必须被安全物理擦除！");
+        assert_eq!(vm.entries.len(), 1);
+        assert_eq!(vm.entries[0].id, id2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_secure_notes_lifecycle() {
+        let base = tmp_base("notes_test");
+        let mut vm = make_test_vm(&base, "vault-notes");
+        vm.master_key = Some(crypto::ProtectedMasterKey::new([9u8; 32]));
+        vm.is_unlocked = true;
+
+        let note_title = "Secret Server Credential";
+        let note_body = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... root@bastion";
+
+        // 1. 新建便签
+        let note_entry = vm.save_note(None, note_title, note_body).unwrap();
+        assert_eq!(note_entry.kind, "note");
+        assert_eq!(note_entry.name, format!("{note_title}.note"));
+        assert_eq!(note_entry.size, note_body.len() as u64);
+
+        // 2. 验证落盘文件是加密的而非明文
+        let blob_path = vm.data_dir.join(&note_entry.cipher_path);
+        assert!(blob_path.exists());
+        let disk_bytes = fs::read(&blob_path).unwrap();
+        assert!(!String::from_utf8_lossy(&disk_bytes).contains("ssh-ed25519"));
+
+        // 3. 读取解密便签
+        let read_content = vm.read_note(&note_entry.id).unwrap();
+        assert_eq!(read_content, note_body);
+
+        // 4. 更新便签内容
+        let updated_body = "ssh-ed25519 UPDATED_KEY root@bastion";
+        let updated_entry = vm
+            .save_note(Some(note_entry.id.clone()), "Updated Title", updated_body)
+            .unwrap();
+        assert_eq!(updated_entry.name, "Updated Title.note");
+        let read_updated = vm.read_note(&note_entry.id).unwrap();
+        assert_eq!(read_updated, updated_body);
+
+        // 5. 预览便签
+        let preview = vm.read_entry_preview(&note_entry.id).unwrap();
+        assert_eq!(preview.kind, "text");
+        assert_eq!(preview.text_content.unwrap(), updated_body);
 
         let _ = fs::remove_dir_all(&base);
     }

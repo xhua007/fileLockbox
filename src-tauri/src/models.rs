@@ -13,6 +13,12 @@ pub struct VaultEntry {
     pub original_path: Option<String>,
     /// 密文文件相对路径（位于 data_dir 下）
     pub cipher_path: String,
+    /// 是否处于回收站中（软删除）
+    #[serde(default)]
+    pub is_deleted: bool,
+    /// 移入回收站的时间戳（unix ms）
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 /// 落盘的 keyring：保存用「密码」和「恢复码」分别包装后的主密钥。
